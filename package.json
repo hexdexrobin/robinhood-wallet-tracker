@@ -1,0 +1,30 @@
+{
+  "name": "robinhood-wallet-tracker",
+  "version": "1.0.0",
+  "description": "Node.js wallet tracker bot for Robinhood Chain (EVM L2) using Alchemy API and ethers.js v6",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "add": "bash add-wallet.sh",
+    "wallets": "bash list-wallets.sh",
+    "list": "bash list-wallets.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "robinhood-chain",
+    "alchemy",
+    "ethers",
+    "wallet-tracker",
+    "webhook"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "alchemy-sdk": "^3.6.5",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "express": "^4.21.2"
+  }
+}
