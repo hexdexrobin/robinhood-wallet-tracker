@@ -182,3 +182,24 @@ robinhood-wallet-tracker/
 ## License
 
 MIT
+
+
+## Telegram
+
+Set in `.env`:
+
+```env
+TELEGRAM_BOT_TOKEN=from_BotFather
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Commands in the bot chat:
+
+| Command | Action |
+|---------|--------|
+| `/add 0x...` | Track a wallet |
+| `/wallets` | List tracked wallets |
+| `/alerts` | Recent transfer/token alerts |
+| `/help` | Help |
+
+Alerts (transfers + token deploys) are pushed automatically to the same chat.

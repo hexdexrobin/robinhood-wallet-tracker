@@ -8,6 +8,7 @@ node_modules/
 
 # logs / runtime
 *.log
+alerts.log
 npm-debug.log*
 /tmp/
 

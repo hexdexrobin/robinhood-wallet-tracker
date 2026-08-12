@@ -8,7 +8,8 @@
     "dev": "node --watch index.js",
     "add": "bash add-wallet.sh",
     "wallets": "bash list-wallets.sh",
-    "list": "bash list-wallets.sh"
+    "list": "bash list-wallets.sh",
+    "alerts": "bash -c 'curl -sS http://127.0.0.1:${PORT:-3000}/alerts | python3 -m json.tool 2>/dev/null || curl -sS http://127.0.0.1:${PORT:-3000}/alerts'"
   },
   "engines": {
     "node": ">=18"
