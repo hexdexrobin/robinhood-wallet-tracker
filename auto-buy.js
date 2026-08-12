@@ -275,11 +275,12 @@ async function maybeAutoBuyToken(opts) {
       resolve({ ok: false, error: err.message, logFile });
     });
 
-    // Don't wait for auto-watch forever — consider "started" after spawn
+    // Keep process independent of tracker restarts
     child.unref();
 
-    // Mark as bought after a short delay if process still alive (swap started)
-    setTimeout(async () => {
+    // Do NOT close logFd immediately — watch-pnl runs for minutes/hours
+    // Closing the fd early can break child stdout and kill monitoring.
+    const notifyStarted = setTimeout(async () => {
       buyingNow.delete(token);
       boughtTokens.add(token);
       console.log(
@@ -289,17 +290,27 @@ async function maybeAutoBuyToken(opts) {
         await notify(
           `✅ AUTO-BUY process lancé\n` +
             `${symbol} pid=${child.pid}\n` +
+            `montant: ${amount} ETH\n` +
+            `TP +${takeProfit}% · SL -${stopLoss}%\n` +
             `log: ${path.basename(logFile)}\n` +
-            `(swap en cours — voir logs du bot Uniswap)`
+            `(watch PnL actif jusqu'à vente TP/SL)`
         );
       }
+      resolve({ ok: true, pid: child.pid, logFile, token, amount });
+    }, 2500);
+
+    child.on("exit", (code, signal) => {
+      clearTimeout(notifyStarted);
+      buyingNow.delete(token);
+      console.log(
+        `[AUTO-BUY] child exit code=${code} signal=${signal} ${symbol}`
+      );
       try {
         fs.closeSync(logFd);
       } catch {
-        /* already closed if child exited */
+        /* */
       }
-      resolve({ ok: true, pid: child.pid, logFile, token, amount });
-    }, 2000);
+    });
   });
 }
 
