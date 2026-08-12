@@ -124,7 +124,7 @@ async function maybeAutoBuyToken(opts) {
     return { skipped: true, reason: "bot-missing" };
   }
 
-  const amount = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
+  let amount = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
   const slippage = String(envNum("AUTO_BUY_SLIPPAGE", 3));
   const takeProfit = String(envNum("AUTO_BUY_TAKE_PROFIT", 100));
   const stopLoss = String(envNum("AUTO_BUY_STOP_LOSS", 40));
@@ -132,6 +132,58 @@ async function maybeAutoBuyToken(opts) {
   const dryRun = envBool("AUTO_BUY_DRY_RUN", false);
   const ammOnly = envBool("AUTO_BUY_AMM_ONLY", true);
   const autoWatch = envBool("AUTO_BUY_AUTO_WATCH", true);
+
+  // Pre-check trading wallet ETH balance (need amount + gas reserve)
+  try {
+    const { ethers } = require("ethers");
+    const uniEnv = loadUniswapEnv(botPath);
+    let pk = uniEnv.PRIVATE_KEY || process.env.PRIVATE_KEY || "";
+    pk = pk.trim().replace(/^["']|["']$/g, "");
+    if (pk && !pk.startsWith("0x")) pk = "0x" + pk;
+    const rpc =
+      uniEnv.RPC_URL ||
+      process.env.RPC_URL ||
+      "https://rpc.mainnet.chain.robinhood.com";
+    if (pk && pk.length >= 66) {
+      const provider = new ethers.JsonRpcProvider(rpc, 4663);
+      const wallet = new ethers.Wallet(pk, provider);
+      const balWei = await provider.getBalance(wallet.address);
+      const balEth = Number(ethers.formatEther(balWei));
+      const want = Number(amount);
+      // Keep ~0.00015 ETH for gas on Robinhood L2
+      const gasReserve = Number(process.env.AUTO_BUY_GAS_RESERVE || "0.00015");
+      const maxSpend = Math.max(0, balEth - gasReserve);
+      if (maxSpend < 0.00005) {
+        const msg =
+          `❌ AUTO-BUY impossible — wallet trading à sec\n` +
+          `${wallet.address}\n` +
+          `Balance: ${balEth} ETH\n` +
+          `Demandé: ${amount} ETH (+ gas)\n` +
+          `→ Envoie de l'ETH sur ce wallet`;
+        console.error(`[AUTO-BUY] ${msg.replace(/\n/g, " | ")}`);
+        if (notify) await notify(msg);
+        return { skipped: true, reason: "insufficient-balance", balEth };
+      }
+      if (want > maxSpend) {
+        // Auto-reduce amount to what we can afford
+        const reduced = Math.floor(maxSpend * 1e6) / 1e6; // 6 decimals
+        console.warn(
+          `[AUTO-BUY] reducing amount ${want} → ${reduced} ETH (bal=${balEth})`
+        );
+        amount = String(reduced);
+        if (notify) {
+          await notify(
+            `⚠️ Balance faible — montant réduit\n` +
+              `${balEth.toFixed(6)} ETH dispo\n` +
+              `Achat ajusté: ${amount} ETH (au lieu de ${want})\n` +
+              `${wallet.address}`
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[AUTO-BUY] balance precheck failed: ${err.message || err}`);
+  }
 
   const tsxBin = path.join(botPath, "node_modules", ".bin", "tsx");
   const useTsx = fs.existsSync(tsxBin) ? tsxBin : "npx";
