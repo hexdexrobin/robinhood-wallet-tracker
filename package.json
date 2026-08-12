@@ -10,6 +10,7 @@
     "wallets": "bash list-wallets.sh",
     "list": "bash list-wallets.sh",
     "alerts": "bash -c 'curl -sS http://127.0.0.1:${PORT:-3000}/alerts | python3 -m json.tool 2>/dev/null || curl -sS http://127.0.0.1:${PORT:-3000}/alerts'",
+    "balances": "bash -c 'curl -sS http://127.0.0.1:${PORT:-3000}/balances | python3 -m json.tool 2>/dev/null || curl -sS http://127.0.0.1:${PORT:-3000}/balances'",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:restart": "pm2 restart robinhood-wallet-tracker",
     "pm2:logs": "pm2 logs robinhood-wallet-tracker"

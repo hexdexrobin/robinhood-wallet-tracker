@@ -1926,6 +1926,53 @@ app.get("/alerts", (req, res) => {
   }
 });
 
+/**
+ * GET /balances — ETH balances for all tracked wallets
+ * GET /balances?address=0x... — detail one wallet (+ tokens if API allows)
+ */
+app.get("/balances", async (req, res) => {
+  try {
+    const one = req.query.address;
+    if (one) {
+      const info = await fetchWalletBalances(String(one));
+      return res.json({ ok: true, ...info });
+    }
+    const list = [...trackedWallets];
+    const wallets = [];
+    let totalEth = 0;
+    for (const a of list) {
+      try {
+        const wei = await provider.getBalance(a);
+        const eth = ethers.formatEther(wei);
+        totalEth += Number(eth);
+        wallets.push({
+          address: a,
+          label: walletMeta.get(a)?.label || "",
+          eth,
+          ethShort: formatEthShort(wei, true),
+        });
+      } catch (e) {
+        wallets.push({
+          address: a,
+          label: walletMeta.get(a)?.label || "",
+          error: e.message || String(e),
+        });
+      }
+    }
+    wallets.sort((a, b) => Number(b.eth || 0) - Number(a.eth || 0));
+    const trading = await fetchTradingWalletBalance();
+    return res.json({
+      ok: true,
+      count: wallets.length,
+      totalEth,
+      wallets,
+      tradingWallet: trading,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Telegram bot — buttons + labels + commands
 // ---------------------------------------------------------------------------
@@ -2048,7 +2095,7 @@ async function registerTelegramCommands() {
     { command: "label", description: "Renommer: /label 0x... Nom" },
     { command: "remove", description: "Retirer: /remove 0x..." },
     { command: "alerts", description: "Dernières alertes" },
-    { command: "balance", description: "Balance ETH d'un wallet" },
+    { command: "balance", description: "Balances (tous ou /balance 0x)" },
     { command: "buy", description: "Achat manuel: /buy 0xTOKEN [ETH]" },
     { command: "autobuy", description: "Auto-buy: /autobuy on|off" },
     { command: "amount", description: "Montant auto: /amount 0.001" },
@@ -2184,7 +2231,8 @@ async function tgShowHelp(chatId) {
       `/wallets — liste + boutons\n` +
       `/label 0x... Nom — renommer\n` +
       `/remove 0x... — arrêter le suivi\n` +
-      `/balance 0x... — solde ETH\n` +
+      `/balance — soldes ETH de tous les wallets\n` +
+      `/balance 0x... — détail ETH + tokens\n` +
       `/scan 0x... — scan hops / tokens (si vide)\n` +
       `/export — copier toutes les adresses\n\n` +
       `🚨 Alertes\n` +
@@ -2279,18 +2327,231 @@ async function tgShowConfig(chatId) {
   );
 }
 
+/** Format ETH for display (trim trailing zeros) */
+function formatEthShort(weiOrEther, isWei = true) {
+  try {
+    const eth = isWei
+      ? Number(ethers.formatEther(weiOrEther))
+      : Number(weiOrEther);
+    if (!Number.isFinite(eth)) return "?";
+    if (eth === 0) return "0";
+    if (eth < 0.0001) return eth.toExponential(2);
+    if (eth < 1) return eth.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+    return eth.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  } catch {
+    return "?";
+  }
+}
+
+/**
+ * Fetch ETH balance (+ optional ERC20 balances via alchemy getTokenBalances if available).
+ */
+async function fetchWalletBalances(address) {
+  const a = normalizeAddress(address);
+  const ethWei = await provider.getBalance(a);
+  const eth = ethers.formatEther(ethWei);
+  /** @type {{ symbol: string, address: string, balance: string }[]} */
+  let tokens = [];
+
+  // Alchemy enhanced: alchemy_getTokenBalances
+  try {
+    const res = await alchemyRpc("alchemy_getTokenBalances", [a, "erc20"]);
+    const rows = res?.tokenBalances || [];
+    for (const row of rows.slice(0, 25)) {
+      const raw = row.tokenBalance;
+      if (!raw || raw === "0x0" || raw === "0x") continue;
+      const contract = (row.contractAddress || "").toLowerCase();
+      if (!contract) continue;
+      let decimals = 18;
+      let symbol = contract.slice(0, 8) + "…";
+      try {
+        const meta = await readErc20Metadata(contract);
+        if (meta.decimals != null) decimals = meta.decimals;
+        if (meta.symbol) symbol = meta.symbol;
+      } catch {
+        /* */
+      }
+      let balHuman = "?";
+      try {
+        balHuman = ethers.formatUnits(BigInt(raw), decimals);
+        const n = Number(balHuman);
+        if (n === 0) continue;
+        if (n < 0.0001) continue; // dust
+        balHuman =
+          n >= 1
+            ? n.toFixed(2).replace(/\.00$/, "")
+            : n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+      } catch {
+        continue;
+      }
+      tokens.push({ symbol, address: contract, balance: balHuman });
+    }
+    // biggest first (rough numeric)
+    tokens.sort((x, y) => Number(y.balance) - Number(x.balance));
+    tokens = tokens.slice(0, 12);
+  } catch (err) {
+    console.log(
+      `[BALANCE] tokenBalances unavailable for ${a}: ${err.message || err}`
+    );
+  }
+
+  return {
+    address: a,
+    eth,
+    ethShort: formatEthShort(ethWei, true),
+    tokens,
+    tracked: trackedWallets.has(a),
+    label: walletMeta.get(a)?.label || "",
+  };
+}
+
+/** Trading wallet from uniswap bot PRIVATE_KEY (if configured) */
+async function fetchTradingWalletBalance() {
+  try {
+    const botPath =
+      process.env.UNISWAP_BOT_PATH ||
+      path.resolve(__dirname, "..", "robinhood-uniswap-bot");
+    const envPath = path.join(botPath, ".env");
+    if (!fs.existsSync(envPath)) return null;
+    const text = fs.readFileSync(envPath, "utf8");
+    const m = text.match(/^PRIVATE_KEY=(.+)$/m);
+    if (!m) return null;
+    let pk = m[1].trim().replace(/^["']|["']$/g, "");
+    if (!pk.startsWith("0x")) pk = "0x" + pk;
+    if (pk.length < 66) return null;
+    const w = new ethers.Wallet(pk);
+    const info = await fetchWalletBalances(w.address);
+    return { ...info, isTrading: true };
+  } catch (err) {
+    console.warn(`[BALANCE] trading wallet: ${err.message || err}`);
+    return null;
+  }
+}
+
 async function tgShowBalance(chatId, address) {
   try {
-    const a = normalizeAddress(address);
-    const bal = ethers.formatEther(await provider.getBalance(a));
-    const tracked = trackedWallets.has(a) ? "oui" : "non";
+    const info = await fetchWalletBalances(address);
+    let tokenBlock = "";
+    if (info.tokens.length) {
+      tokenBlock =
+        "\n\nTokens:\n" +
+        info.tokens
+          .map((t) => `• ${t.symbol}: ${t.balance}\n  ${t.address}`)
+          .join("\n");
+    } else {
+      tokenBlock = "\n\nTokens: (aucun ERC-20 détecté / API limitée)";
+    }
     await sendTelegram(
       `💰 Balance\n` +
-        `${walletLine(a)}\n\n` +
-        `${bal} ETH\n` +
-        `suivi: ${tracked}`,
+        `${walletLine(info.address)}\n\n` +
+        `ETH: ${info.ethShort}\n` +
+        `(${info.eth} exact)\n` +
+        `suivi: ${info.tracked ? "oui" : "non"}` +
+        tokenBlock,
       chatId,
-      { reply_markup: mainReplyKeyboard() }
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔄 Refresh", callback_data: `bal:${info.address}` },
+              { text: "📋 Tous", callback_data: "menu:balances" },
+            ],
+          ],
+        },
+      }
+    );
+  } catch (err) {
+    await sendTelegram(`❌ ${err.message || err}`, chatId);
+  }
+}
+
+/**
+ * Show ETH balances for all tracked wallets (+ trading wallet if available).
+ */
+async function tgShowAllBalances(chatId) {
+  await sendTelegram("💰 Chargement des balances…", chatId);
+  try {
+    const list = [...trackedWallets];
+    if (list.length === 0) {
+      await sendTelegram(
+        "Aucun wallet suivi.\n/add 0x... d’abord",
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+      return;
+    }
+
+    const rows = [];
+    let total = 0;
+    // sequential to avoid rate limits
+    for (const a of list) {
+      try {
+        const wei = await provider.getBalance(a);
+        const eth = Number(ethers.formatEther(wei));
+        total += eth;
+        rows.push({
+          address: a,
+          label: walletMeta.get(a)?.label || "",
+          eth,
+          short: formatEthShort(wei, true),
+        });
+      } catch {
+        rows.push({
+          address: a,
+          label: walletMeta.get(a)?.label || "",
+          eth: -1,
+          short: "ERR",
+        });
+      }
+    }
+    rows.sort((a, b) => b.eth - a.eth);
+
+    let body = rows
+      .map((r, i) => {
+        const tag = r.label ? `🏷️ ${r.label}` : r.address.slice(0, 8) + "…";
+        return `${i + 1}. ${tag}\n   ${r.short} ETH\n   ${r.address}`;
+      })
+      .join("\n\n");
+
+    // Trading wallet (auto-buy)
+    const trade = await fetchTradingWalletBalance();
+    let tradeBlock = "";
+    if (trade) {
+      tradeBlock =
+        `\n\n🛒 Wallet trading (auto-buy)\n` +
+        `${trade.ethShort} ETH\n` +
+        `${trade.address}`;
+      if (trade.tokens?.length) {
+        tradeBlock +=
+          "\n" +
+          trade.tokens
+            .slice(0, 6)
+            .map((t) => `• ${t.symbol}: ${t.balance}`)
+            .join("\n");
+      }
+    }
+
+    // Inline: top wallets for detail
+    const kb = {
+      inline_keyboard: [
+        ...rows.slice(0, 8).map((r) => [
+          {
+            text: `${r.short} Ξ ${r.label || r.address.slice(0, 6)}`,
+            callback_data: `bal:${r.address}`,
+          },
+        ]),
+        [{ text: "🔄 Refresh", callback_data: "menu:balances" }],
+      ],
+    };
+
+    await sendTelegram(
+      `💰 Balances ETH — ${rows.length} wallets\n` +
+        `Total suivi ≈ ${formatEthShort(String(total), false)} ETH\n\n` +
+        body +
+        tradeBlock +
+        `\n\nTape /balance 0x... pour le détail tokens`,
+      chatId,
+      { reply_markup: kb }
     );
   } catch (err) {
     await sendTelegram(`❌ ${err.message || err}`, chatId);
@@ -2501,6 +2762,11 @@ async function handleTelegramCallback(cq) {
     await tgShowStatus(chatId);
     return;
   }
+  if (data === "menu:balances") {
+    await answerCallback(qid);
+    await tgShowAllBalances(chatId);
+    return;
+  }
   if (data === "menu:config") {
     await answerCallback(qid);
     await tgShowConfig(chatId);
@@ -2689,12 +2955,7 @@ async function handleTelegramMessage(msg) {
     return;
   }
   if (text === "💰 Balance" || text === "Balance") {
-    tgPending.set(String(chatId), { action: "balance" });
-    await sendTelegram(
-      "💰 Envoie l’adresse 0x... pour voir la balance ETH\n" +
-        "(ou /balance 0x...)",
-      chatId
-    );
+    await tgShowAllBalances(chatId);
     return;
   }
   if (text === "⚙️ Config" || text === "Config") {
@@ -2913,10 +3174,9 @@ async function handleTelegramMessage(msg) {
     return;
   }
 
-  if (cmd === "/balance" || cmd === "/bal") {
+  if (cmd === "/balance" || cmd === "/bal" || cmd === "/balances") {
     if (!args[0]) {
-      tgPending.set(String(chatId), { action: "balance" });
-      await sendTelegram("Envoie l’adresse 0x…", chatId);
+      await tgShowAllBalances(chatId);
       return;
     }
     await tgShowBalance(chatId, args[0]);
