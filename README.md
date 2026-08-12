@@ -89,7 +89,22 @@ Restart the bot so it uses the new URL when creating/updating the Alchemy webhoo
 
 ## API usage
 
-### Add a wallet
+### Add a wallet (CLI)
+
+With the bot running (`npm start` in another terminal):
+
+```bash
+# one wallet
+npm run add -- 0xYourWalletAddressHere
+
+# several wallets
+npm run add -- 0xAAA... 0xBBB...
+
+# list tracked wallets
+npm run wallets
+```
+
+Or with curl:
 
 ```bash
 curl -X POST http://localhost:3000/add-wallet \
