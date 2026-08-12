@@ -491,20 +491,69 @@ function normalizeAddress(address) {
 // Wallet personalization + JSON persistence
 // ---------------------------------------------------------------------------
 
-/** Display name: custom label or short address */
+/** Short address for display: 0x1234…abcd */
+function shortAddr(address) {
+  const a = (address || "").toLowerCase();
+  if (a.length < 12) return a;
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
+/**
+ * Display name: custom label or short address.
+ * Never nests "Hop ← Hop ← …" — hop labels always use short parent address.
+ */
 function walletDisplay(address) {
   const a = (address || "").toLowerCase();
   const meta = walletMeta.get(a);
-  if (meta?.label) return `${meta.label}`;
-  return a;
+  if (meta?.label) {
+    // Sanitize broken nested hop labels from older versions
+    if (/^Hop\s*←\s*Hop/i.test(meta.label)) {
+      if (meta.parent) return `Hop ← ${shortAddr(meta.parent)}`;
+      return shortAddr(a);
+    }
+    return meta.label;
+  }
+  return shortAddr(a);
 }
 
 /** Label + full address line for messages */
 function walletLine(address) {
   const a = (address || "").toLowerCase();
   const meta = walletMeta.get(a);
-  if (meta?.label) return `🏷️ ${meta.label}\n   ${a}`;
+  const label = walletDisplay(a);
+  if (meta?.label || label !== a) {
+    return `🏷️ ${label}\n   ${a}`;
+  }
   return a;
+}
+
+/**
+ * Build a clean auto-label for hop / auto-detect wallets.
+ * Always: "Hop ← 0xabcd…1234" (never chains parent labels).
+ */
+function makeHopLabel(parentAddress) {
+  return `Hop ← ${shortAddr(parentAddress)}`;
+}
+
+/** Fix nested hop labels already stored in walletMeta / disk */
+function sanitizeHopLabels() {
+  let n = 0;
+  for (const [addr, meta] of walletMeta) {
+    if (!meta?.label) continue;
+    if (/^Hop\s*←\s*Hop/i.test(meta.label) || meta.label.length > 28) {
+      if (meta.parent) {
+        meta.label = makeHopLabel(meta.parent);
+        n++;
+      } else if (/^Hop/i.test(meta.label)) {
+        meta.label = `Hop ${shortAddr(addr)}`;
+        n++;
+      }
+    }
+  }
+  if (n > 0) {
+    saveWalletsDb();
+    console.log(`[TRACKER] Sanitized ${n} nested hop label(s)`);
+  }
 }
 
 function ensureWalletMeta(address, extra = {}) {
@@ -1681,12 +1730,13 @@ async function addWallet(rawAddress, meta = {}) {
   }
 
   trackedWallets.add(address);
+  // Clean hop label: never nest parent labels ("Hop ← Hop ← …")
   const autoLabel =
-    meta.label ||
+    (meta.label && !/^Hop\s*←\s*Hop/i.test(meta.label) ? meta.label : "") ||
     (meta.parent
-      ? `Hop ← ${walletDisplay(meta.parent).slice(0, 20)}`
+      ? makeHopLabel(meta.parent)
       : meta.source && String(meta.source).includes("auto")
-        ? `Auto ${new Date().toISOString().slice(5, 16)}`
+        ? `Auto ${shortAddr(address)}`
         : "");
   ensureWalletMeta(address, {
     label: autoLabel,
@@ -3478,9 +3528,16 @@ app.listen(PORT, async () => {
     console.log(`[TRACKER] Restoring ${saved.length} wallet(s) from disk...`);
     for (const w of saved) {
       try {
+        // Fix nested hop labels before restore
+        let label = w.label || "";
+        if (/^Hop\s*←\s*Hop/i.test(label) && w.parent) {
+          label = makeHopLabel(w.parent);
+        } else if (/^Hop\s*←\s*Hop/i.test(label)) {
+          label = `Hop ${shortAddr(w.address)}`;
+        }
         await addWallet(w.address, {
           source: w.source || "restore",
-          label: w.label || "",
+          label,
           parent: w.parent || null,
         });
         if (w.note) {
@@ -3492,6 +3549,7 @@ app.listen(PORT, async () => {
         );
       }
     }
+    sanitizeHopLabels();
     saveWalletsDb();
   }
 
