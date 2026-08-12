@@ -20,6 +20,7 @@ const fs = require("fs");
 const path = require("path");
 const express = require("express");
 const { ethers } = require("ethers");
+const { maybeAutoBuyToken } = require("./auto-buy");
 
 // ---------------------------------------------------------------------------
 // Config
@@ -38,6 +39,8 @@ const ROBINHOOD_NETWORK_SLUG = "robinhood-mainnet";
 
 // Local alert log (one line JSON per signal)
 const ALERTS_LOG_PATH = path.join(__dirname, "alerts.log");
+// Persisted wallet personalization (labels/notes) + list across restarts
+const WALLETS_DB_PATH = path.join(__dirname, "data", "wallets.json");
 
 const {
   ALCHEMY_API_KEY,
@@ -70,6 +73,15 @@ const provider = new ethers.JsonRpcProvider(RPC_URL, CHAIN_ID_MAINNET);
 
 /** @type {Set<string>} checksum-normalized lowercase addresses */
 const trackedWallets = new Set();
+
+/**
+ * Personalization per wallet.
+ * @type {Map<string, { address: string, label: string, note: string, addedAt: string, source: string, parent: string|null }>}
+ */
+const walletMeta = new Map();
+
+/** Telegram multi-step pending actions: chatId -> { action, address? } */
+const tgPending = new Map();
 
 /** Alchemy ADDRESS_ACTIVITY webhook id, once created/found */
 let addressActivityWebhookId = null;
@@ -202,10 +214,13 @@ async function signalTransfer(alert) {
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     await sendTelegram(
       `🚨 TRANSFERT (${direction === "IN" ? "REÇU" : "ENVOYÉ"})\n` +
-        `wallet: ${wallet}\n` +
+        `wallet: ${walletDisplay(wallet)}\n` +
+        `${wallet}\n` +
         `${from} → ${to}\n` +
         `${valueStr} ${assetStr}\n` +
-        `hash: ${hash || "?"}`
+        `hash: ${hash || "?"}`,
+      TELEGRAM_CHAT_ID,
+      { reply_markup: mainReplyKeyboard() }
     );
   }
 }
@@ -470,6 +485,152 @@ async function notifyUpdateWebhookAddresses(webhookId, addressesToAdd) {
 /** Normalize an address to lowercase hex for Set membership. */
 function normalizeAddress(address) {
   return ethers.getAddress(address).toLowerCase();
+}
+
+// ---------------------------------------------------------------------------
+// Wallet personalization + JSON persistence
+// ---------------------------------------------------------------------------
+
+/** Display name: custom label or short address */
+function walletDisplay(address) {
+  const a = (address || "").toLowerCase();
+  const meta = walletMeta.get(a);
+  if (meta?.label) return `${meta.label}`;
+  return a;
+}
+
+/** Label + full address line for messages */
+function walletLine(address) {
+  const a = (address || "").toLowerCase();
+  const meta = walletMeta.get(a);
+  if (meta?.label) return `🏷️ ${meta.label}\n   ${a}`;
+  return a;
+}
+
+function ensureWalletMeta(address, extra = {}) {
+  const a = address.toLowerCase();
+  if (!walletMeta.has(a)) {
+    walletMeta.set(a, {
+      address: a,
+      label: extra.label || "",
+      note: extra.note || "",
+      addedAt: extra.addedAt || new Date().toISOString(),
+      source: extra.source || "api",
+      parent: extra.parent || null,
+    });
+  } else if (extra.label != null && extra.label !== "") {
+    walletMeta.get(a).label = extra.label;
+  }
+  if (extra.note != null) walletMeta.get(a).note = extra.note;
+  if (extra.source) walletMeta.get(a).source = extra.source;
+  if (extra.parent) walletMeta.get(a).parent = extra.parent;
+  return walletMeta.get(a);
+}
+
+function saveWalletsDb() {
+  try {
+    fs.mkdirSync(path.dirname(WALLETS_DB_PATH), { recursive: true });
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      webhookId: addressActivityWebhookId,
+      wallets: [...trackedWallets].map((a) => {
+        const m = walletMeta.get(a) || { address: a, label: "", note: "" };
+        return {
+          address: a,
+          label: m.label || "",
+          note: m.note || "",
+          addedAt: m.addedAt || null,
+          source: m.source || null,
+          parent: m.parent || null,
+        };
+      }),
+    };
+    fs.writeFileSync(WALLETS_DB_PATH, JSON.stringify(payload, null, 2));
+  } catch (err) {
+    console.error(`[TRACKER] save wallets db failed: ${err.message || err}`);
+  }
+}
+
+function loadWalletsDb() {
+  try {
+    if (!fs.existsSync(WALLETS_DB_PATH)) return [];
+    const data = JSON.parse(fs.readFileSync(WALLETS_DB_PATH, "utf8"));
+    if (data.webhookId && !addressActivityWebhookId) {
+      addressActivityWebhookId = data.webhookId;
+    }
+    return Array.isArray(data.wallets) ? data.wallets : [];
+  } catch (err) {
+    console.error(`[TRACKER] load wallets db failed: ${err.message || err}`);
+    return [];
+  }
+}
+
+/**
+ * Set or clear a custom label for a tracked wallet.
+ */
+function setWalletLabel(rawAddress, label) {
+  const address = normalizeAddress(rawAddress);
+  if (!trackedWallets.has(address)) {
+    throw new Error("Wallet non suivi — ajoute-le d’abord");
+  }
+  ensureWalletMeta(address);
+  walletMeta.get(address).label = String(label || "").trim().slice(0, 48);
+  saveWalletsDb();
+  return walletMeta.get(address);
+}
+
+/**
+ * Remove a wallet from tracking (memory + webhook + db).
+ */
+async function removeWallet(rawAddress) {
+  const address = normalizeAddress(rawAddress);
+  if (!trackedWallets.has(address)) {
+    return { address, removed: false };
+  }
+  trackedWallets.delete(address);
+  walletMeta.delete(address);
+  lastSeenOutgoingHash.delete(address);
+
+  if (addressActivityWebhookId && ALCHEMY_AUTH_TOKEN) {
+    try {
+      await notifyUpdateWebhookAddressesRemove(addressActivityWebhookId, [
+        address,
+      ]);
+    } catch (err) {
+      console.warn(
+        `[TRACKER] webhook remove address failed: ${err.message || err}`
+      );
+    }
+  }
+  saveWalletsDb();
+  console.log(`[TRACKER] Removed wallet ${address}`);
+  return { address, removed: true };
+}
+
+/** Notify API: remove addresses from webhook */
+async function notifyUpdateWebhookAddressesRemove(webhookId, addressesToRemove) {
+  const res = await fetch(
+    "https://dashboard.alchemy.com/api/update-webhook-addresses",
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Alchemy-Token": ALCHEMY_AUTH_TOKEN,
+      },
+      body: JSON.stringify({
+        webhook_id: webhookId,
+        addresses_to_add: [],
+        addresses_to_remove: addressesToRemove,
+      }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      data.message || data.error || `Notify remove failed HTTP ${res.status}`
+    );
+  }
+  return data;
 }
 
 /**
@@ -770,9 +931,13 @@ async function followHopWalletsFromTxs(senderNorm, txHashes, source = "webhook")
         if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
           await sendTelegram(
             `🆕 NOUVEAU WALLET (dernier hop — source vide)\n` +
-              `from: ${senderNorm}\n` +
-              `new: ${newAddr}\n` +
-              `tx: ${txHash}`
+              `from: ${walletDisplay(senderNorm)}\n` +
+              `${senderNorm}\n` +
+              `new: ${walletDisplay(newAddr)}\n` +
+              `${newAddr}\n` +
+              `tx: ${txHash}`,
+            TELEGRAM_CHAT_ID,
+            { reply_markup: mainReplyKeyboard() }
           );
         }
       } catch (err) {
@@ -957,7 +1122,8 @@ async function signalTokenDeploy({ deployer, contractAddress, txHash, meta, sour
   const bar = "═".repeat(72);
   console.log("\x07");
   console.log(`\n${bar}`);
-  console.log(`[TOKEN DEPLOY] 🪙 ${kind} CRÉÉ 🪙  ${ts}`);
+  const launchTag = meta?.launchpad ? "LANCEMENT" : "CRÉÉ";
+  console.log(`[TOKEN DEPLOY] 🪙 ${kind} ${launchTag} 🪙  ${ts}`);
   console.log(`[TOKEN DEPLOY] deployer = ${deployer}`);
   console.log(`[TOKEN DEPLOY] contract = ${contractAddress}`);
   console.log(
@@ -1008,25 +1174,98 @@ async function signalTokenDeploy({ deployer, contractAddress, txHash, meta, sour
   }
 
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+    const buyAmt = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
+    const autoOn = isEnvOn("AUTO_BUY_ENABLED");
     await sendTelegram(
-      `🪙 TOKEN / CONTRACT CRÉÉ\n` +
-        `deployer: ${deployer}\n` +
-        `contract: ${contractAddress}\n` +
-        `${name} (${symbol}) dec=${decimals} supply=${supply}\n` +
-        `tx: ${txHash}`
+      `🪙 TOKEN ${meta?.launchpad ? "LANCÉ" : "CRÉÉ"}\n` +
+        `deployer: ${walletDisplay(deployer)}\n` +
+        `${deployer}\n` +
+        `token: ${contractAddress}\n` +
+        `**${name} (${symbol})**\n` +
+        `decimals=${decimals} supply=${supply}\n` +
+        `tx: ${txHash}\n\n` +
+        (autoOn
+          ? `🛒 Auto-buy ON → ${buyAmt} ETH`
+          : `⏸ Auto-buy OFF — choisis un montant :`),
+      TELEGRAM_CHAT_ID,
+      {
+        reply_markup: meta?.isErc20Like
+          ? tokenBuyKeyboard(contractAddress)
+          : mainReplyKeyboard(),
+      }
     );
+  }
+
+  // Auto-buy via robinhood-uniswap-bot when a tracked wallet launches/creates a token
+  if (meta?.isErc20Like) {
+    setImmediate(() => {
+      maybeAutoBuyToken({
+        tokenAddress: contractAddress,
+        deployer,
+        symbol: String(symbol),
+        name: String(name),
+        txHash,
+        launchpad: Boolean(meta?.launchpad),
+        isErc20Like: true,
+        fromCreate: !meta?.launchpad && Boolean(contractAddress),
+        notify: (msg) =>
+          sendTelegram(msg, TELEGRAM_CHAT_ID, {
+            reply_markup: mainReplyKeyboard(),
+          }),
+      }).catch((err) => {
+        console.error(`[AUTO-BUY] failed: ${err.message || err}`);
+      });
+    });
   }
 
   void key;
 }
 
 /**
- * Detect token/contract creation in a transaction from a tracked wallet.
+ * Infrastructure / base assets that mint during launches but are NOT the new token.
+ * (WETH wrap, Uniswap position NFTs, known routers, etc.)
+ */
+const SKIP_TOKEN_ADDRESSES = new Set(
+  [
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73", // WETH on Robinhood
+    "0x73991a25c818bf1f1128deaab1492d45638de0d3", // Uniswap V3 Positions NFT
+    "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb", // launch/router helper
+    "0x736d76699c26d0d966744cae304c000d471f7f35", // swap helper often seen
+    "0x5b8d85ebabf17cf6b67bfa2fe6795623951cd70e", // drain helper
+  ].map((a) => a.toLowerCase())
+);
+
+const SKIP_TOKEN_SYMBOLS = new Set(
+  [
+    "WETH",
+    "ETH",
+    "USDC",
+    "USDT",
+    "DAI",
+    "WBTC",
+    "UNI-V3-POS",
+    "UNI-V2",
+  ].map((s) => s.toUpperCase())
+);
+
+function isSkippedLaunchToken(tokenAddr, meta) {
+  if (SKIP_TOKEN_ADDRESSES.has(tokenAddr.toLowerCase())) return true;
+  const sym = (meta?.symbol || "").toUpperCase();
+  const name = (meta?.name || "").toLowerCase();
+  if (sym && SKIP_TOKEN_SYMBOLS.has(sym)) return true;
+  if (name.includes("uniswap") || name.includes("position nft")) return true;
+  if (name === "wrapped ether" || name === "weth") return true;
+  return false;
+}
+
+/**
+ * Detect token/contract creation OR launchpad launch from a tracked wallet.
  *
  * Strategies:
- *  A) Classic CREATE: receipt.contractAddress is set (tx.to == null)
- *  B) Factory / mint: logs contain ERC-20 Transfer(from=0x0, ...) → token address = log.address
- *     and we only keep it if code exists and looks like ERC-20
+ *  A) Classic CREATE: receipt.contractAddress set
+ *  B) Launchpad / factory: ERC-20 Transfer(from=0x0) mint of a NEW token
+ *     (common pattern: send ETH to router 0xa5aab3… which mints token + LP)
+ *     Filters WETH / UNI-V3 NFT / known infra.
  */
 async function detectTokenCreationFromTx(txHash, deployer, source = "webhook") {
   if (!txHash || !txHash.startsWith("0x") || txHash.length !== 66) {
@@ -1048,6 +1287,7 @@ async function detectTokenCreationFromTx(txHash, deployer, source = "webhook") {
   }
 
   const found = [];
+  const deployerNorm = (deployer || "").toLowerCase();
 
   // --- A) Direct contract creation ---
   if (receipt.contractAddress) {
@@ -1056,42 +1296,113 @@ async function detectTokenCreationFromTx(txHash, deployer, source = "webhook") {
       `[TOKEN DEPLOY] CREATE detected: ${c} by ${deployer} in ${txHash}`
     );
     const meta = await readErc20Metadata(c);
-    await signalTokenDeploy({
-      deployer,
-      contractAddress: c,
-      txHash,
-      meta,
-      source,
-    });
-    found.push(c);
+    if (!isSkippedLaunchToken(c, meta)) {
+      await signalTokenDeploy({
+        deployer,
+        contractAddress: c,
+        txHash,
+        meta,
+        source,
+      });
+      found.push(c);
+    } else {
+      console.log(`[TOKEN DEPLOY] skip CREATE infra ${c}`);
+    }
   }
 
-  // --- B) Transfer from zero address = mint (often right after factory deploy) ---
-  // ERC-20 Transfer(address,address,uint256) topic0
+  // --- B) Mints in logs = launchpad / factory token birth ---
   const TRANSFER_TOPIC =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
   const ZERO_TOPIC =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
 
-  const mintCandidates = new Set();
+  /** @type {Map<string, { toDeployer: boolean, mintTo: string|null }>} */
+  const mintInfo = new Map();
   for (const log of receipt.logs || []) {
     if (!log.topics || log.topics[0] !== TRANSFER_TOPIC) continue;
-    // from = topics[1] must be zero for a mint
-    if (log.topics[1] && log.topics[1].toLowerCase() === ZERO_TOPIC) {
-      if (log.address) mintCandidates.add(log.address.toLowerCase());
+    if (!log.topics[1] || log.topics[1].toLowerCase() !== ZERO_TOPIC) continue;
+    const tokenAddr = (log.address || "").toLowerCase();
+    if (!tokenAddr) continue;
+    // topics[2] = to (padded address)
+    let mintTo = null;
+    if (log.topics[2] && log.topics[2].length === 66) {
+      mintTo = "0x" + log.topics[2].slice(26).toLowerCase();
+    }
+    const prev = mintInfo.get(tokenAddr) || {
+      toDeployer: false,
+      mintTo: null,
+    };
+    if (mintTo && deployerNorm && mintTo === deployerNorm) {
+      prev.toDeployer = true;
+    }
+    // also: later Transfer of this token TO deployer counts as launch involvement
+    prev.mintTo = mintTo;
+    mintInfo.set(tokenAddr, prev);
+  }
+
+  // If any Transfer of a mint-candidate ends up at deployer, flag it
+  for (const log of receipt.logs || []) {
+    if (!log.topics || log.topics[0] !== TRANSFER_TOPIC) continue;
+    const tokenAddr = (log.address || "").toLowerCase();
+    if (!mintInfo.has(tokenAddr)) continue;
+    if (log.topics[2] && log.topics[2].length === 66) {
+      const to = "0x" + log.topics[2].slice(26).toLowerCase();
+      if (deployerNorm && to === deployerNorm) {
+        mintInfo.get(tokenAddr).toDeployer = true;
+      }
     }
   }
 
-  // Mint logs alone are too noisy (WETH wrap, LP NFTs, pool mints).
-  // Only treat mint as "token create" if this same tx also CREATEd a contract
-  // (receipt.contractAddress) that matches, or CREATE produced the token.
-  // Additional mint candidates that equal a newly created contract are already
-  // handled in path A. Skip pure mint spam here.
-  for (const tokenAddr of mintCandidates) {
-    if (!receipt.contractAddress) break;
-    if (tokenAddr !== receipt.contractAddress.toLowerCase()) continue;
+  for (const [tokenAddr, info] of mintInfo) {
     if (found.includes(tokenAddr)) continue;
-    // already signaled in path A
+    if (detectedTokenContracts.has(tokenAddr)) continue;
+    if (SKIP_TOKEN_ADDRESSES.has(tokenAddr)) {
+      console.log(`[TOKEN DEPLOY] skip known infra mint ${tokenAddr}`);
+      continue;
+    }
+
+    let code;
+    try {
+      code = await provider.getCode(tokenAddr);
+    } catch {
+      continue;
+    }
+    if (!code || code === "0x" || code === "0x0") continue;
+
+    const meta = await readErc20Metadata(tokenAddr);
+    if (!meta.isErc20Like) {
+      console.log(`[TOKEN DEPLOY] mint ${tokenAddr} not ERC-20-like — skip`);
+      continue;
+    }
+    if (isSkippedLaunchToken(tokenAddr, meta)) {
+      console.log(
+        `[TOKEN DEPLOY] skip mint ${tokenAddr} symbol=${meta.symbol}`
+      );
+      continue;
+    }
+
+    // Prefer mints linked to deployer; still accept unknown new ERC20 minted
+    // in a tx sent by deployer (launchpad create+liq pattern).
+    console.log(
+      `[TOKEN DEPLOY] LAUNCH mint detected: ${tokenAddr} ` +
+        `symbol=${meta.symbol} name=${meta.name} toDeployer=${info.toDeployer} ` +
+        `tx=${txHash}`
+    );
+    await signalTokenDeploy({
+      deployer,
+      contractAddress: tokenAddr,
+      txHash,
+      meta: { ...meta, launchpad: true, toDeployer: info.toDeployer },
+      source,
+    });
+    found.push(tokenAddr);
+  }
+
+  if (found.length === 0 && (receipt.logs || []).length > 0) {
+    console.log(
+      `[TOKEN DEPLOY] no new token found in ${txHash} ` +
+        `(mints=${mintInfo.size}, create=${receipt.contractAddress || "none"})`
+    );
   }
 
   return found;
@@ -1361,17 +1672,37 @@ async function addWallet(rawAddress, meta = {}) {
 
   if (trackedWallets.has(address)) {
     console.log(`[TRACKER] Already tracking ${address}`);
-    return { address, alreadyTracked: true };
+    if (meta.label) setWalletLabel(address, meta.label);
+    return {
+      address,
+      alreadyTracked: true,
+      label: walletMeta.get(address)?.label || "",
+    };
   }
 
   trackedWallets.add(address);
+  const autoLabel =
+    meta.label ||
+    (meta.parent
+      ? `Hop ← ${walletDisplay(meta.parent).slice(0, 20)}`
+      : meta.source && String(meta.source).includes("auto")
+        ? `Auto ${new Date().toISOString().slice(5, 16)}`
+        : "");
+  ensureWalletMeta(address, {
+    label: autoLabel,
+    source: meta.source || "api",
+    parent: meta.parent || null,
+  });
+  saveWalletsDb();
+
   console.log(
     `[TRACKER] Added wallet ${address}` +
+      (autoLabel ? ` label="${autoLabel}"` : "") +
       (meta.source ? ` (source=${meta.source}` : "") +
       (meta.parent ? ` parent=${meta.parent}` : "") +
       (meta.source ? ")" : "")
   );
-  if (meta.source === "auto-detect") {
+  if (meta.source && String(meta.source).includes("auto")) {
     console.log(`[NEW WALLET] Auto-added ${address} to tracker`);
   }
 
@@ -1414,7 +1745,12 @@ async function addWallet(rawAddress, meta = {}) {
       : "webhook unavailable or unconfirmed"
   );
 
-  return { address, alreadyTracked: false };
+  saveWalletsDb();
+  return {
+    address,
+    alreadyTracked: false,
+    label: walletMeta.get(address)?.label || "",
+  };
 }
 
 /**
@@ -1465,12 +1801,13 @@ app.use(express.json({ limit: "2mb" }));
  */
 app.post("/add-wallet", async (req, res) => {
   const address = req.body?.address;
+  const label = req.body?.label;
   if (!address || typeof address !== "string") {
     return res.status(400).json({ error: "Body must include string 'address'" });
   }
 
   try {
-    const result = await addWallet(address, { source: "api" });
+    const result = await addWallet(address, { source: "api", label });
     return res.status(result.alreadyTracked ? 200 : 201).json({
       ok: true,
       ...result,
@@ -1485,11 +1822,48 @@ app.post("/add-wallet", async (req, res) => {
 });
 
 /**
+ * PATCH /wallet-label  Body: { address, label }
+ */
+app.patch("/wallet-label", (req, res) => {
+  try {
+    const meta = setWalletLabel(req.body?.address, req.body?.label || "");
+    return res.json({ ok: true, ...meta });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || String(err) });
+  }
+});
+
+/**
+ * DELETE /wallet  Body: { address }  or query ?address=
+ */
+app.delete("/wallet", async (req, res) => {
+  try {
+    const address = req.body?.address || req.query?.address;
+    const result = await removeWallet(address);
+    return res.json({ ok: true, ...result, trackedCount: trackedWallets.size });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || String(err) });
+  }
+});
+
+/**
  * GET /wallets
  */
 app.get("/wallets", (_req, res) => {
+  const wallets = [...trackedWallets].map((a) => {
+    const m = walletMeta.get(a) || {};
+    return {
+      address: a,
+      label: m.label || "",
+      note: m.note || "",
+      addedAt: m.addedAt || null,
+      source: m.source || null,
+      parent: m.parent || null,
+    };
+  });
   res.json({
-    wallets: [...trackedWallets],
+    wallets,
+    addresses: [...trackedWallets],
     count: trackedWallets.size,
     webhookId: addressActivityWebhookId,
     webhooksSupported,
@@ -1553,25 +1927,215 @@ app.get("/alerts", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Telegram bot — alerts + commands (/add, /wallets, /alerts)
+// Telegram bot — buttons + labels + commands
 // ---------------------------------------------------------------------------
 
+/** Persistent bottom keyboard — best daily actions */
+function mainReplyKeyboard() {
+  const amt = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
+  return {
+    keyboard: [
+      [{ text: "📋 Wallets" }, { text: "🚨 Alertes" }, { text: "📊 Status" }],
+      [{ text: "➕ Ajouter" }, { text: "🛒 AutoBuy" }, { text: `💵 ${amt} ETH` }],
+      [{ text: "⚙️ Config" }, { text: "💰 Balance" }, { text: "ℹ️ Aide" }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+
+/** Inline keyboard to pick buy amount (saved as AUTO_BUY_ETH_AMOUNT) */
+function amountPickKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "0.0005", callback_data: "cfg:amt:0.0005" },
+        { text: "0.001", callback_data: "cfg:amt:0.001" },
+        { text: "0.002", callback_data: "cfg:amt:0.002" },
+      ],
+      [
+        { text: "0.005", callback_data: "cfg:amt:0.005" },
+        { text: "0.01", callback_data: "cfg:amt:0.01" },
+        { text: "0.02", callback_data: "cfg:amt:0.02" },
+      ],
+      [
+        { text: "0.05", callback_data: "cfg:amt:0.05" },
+        { text: "0.1", callback_data: "cfg:amt:0.1" },
+        { text: "✏️ Autre", callback_data: "cfg:amt:custom" },
+      ],
+    ],
+  };
+}
+
+/** Buy buttons on a token alert — amount embedded in callback */
+function tokenBuyKeyboard(tokenAddress) {
+  const t = tokenAddress.toLowerCase();
+  // callback max 64 bytes: "buy:0.001:0x..." ≈ 52
+  return {
+    inline_keyboard: [
+      [
+        { text: "🛒 0.001", callback_data: `buy:0.001:${t}` },
+        { text: "🛒 0.005", callback_data: `buy:0.005:${t}` },
+        { text: "🛒 0.01", callback_data: `buy:0.01:${t}` },
+      ],
+      [
+        { text: "🛒 montant config", callback_data: `buy:cfg:${t}` },
+        { text: "💵 Changer montant", callback_data: "menu:amount" },
+      ],
+    ],
+  };
+}
+
+async function tgShowAmount(chatId) {
+  const cur = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
+  await sendTelegram(
+    `💵 Montant d’achat auto\n\n` +
+      `Actuel : **${cur} ETH** par token lancé\n\n` +
+      `Choisis un montant ci-dessous, ou :\n` +
+      `/amount 0.003\n` +
+      `/buy 0xTOKEN 0.01  (achat one-shot)`,
+    chatId,
+    { reply_markup: amountPickKeyboard() }
+  );
+}
+
+function isEnvOn(name, fallback = false) {
+  const v = process.env[name];
+  if (v === undefined || v === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(v).toLowerCase());
+}
+
+function setEnvRuntime(key, value) {
+  process.env[key] = String(value);
+  // Persist into .env (best-effort)
+  try {
+    const envPath = path.join(__dirname, ".env");
+    let text = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
+    const re = new RegExp(`^${key}=.*$`, "m");
+    if (re.test(text)) {
+      text = text.replace(re, `${key}=${value}`);
+    } else {
+      text = text.trimEnd() + `\n${key}=${value}\n`;
+    }
+    fs.writeFileSync(envPath, text);
+  } catch (err) {
+    console.warn(`[TRACKER] could not persist ${key}: ${err.message}`);
+  }
+}
+
+function autoBuyConfigText() {
+  const sl = Number(process.env.AUTO_BUY_STOP_LOSS || "40");
+  return (
+    `🛒 Auto-buy: ${isEnvOn("AUTO_BUY_ENABLED") ? "ON ✅" : "OFF ⏸"}\n` +
+    `Montant: ${process.env.AUTO_BUY_ETH_AMOUNT || "0.001"} ETH\n` +
+    `Slippage: ${process.env.AUTO_BUY_SLIPPAGE || "3"}%\n` +
+    `Take-profit: +${process.env.AUTO_BUY_TAKE_PROFIT || "100"}%\n` +
+    `Stop-loss: ${sl > 0 ? `-${sl}% 🛑` : "off"}\n` +
+    `Watch PnL: ${isEnvOn("AUTO_BUY_AUTO_WATCH", true) ? "oui" : "non"}\n` +
+    `Dry-run: ${isEnvOn("AUTO_BUY_DRY_RUN") ? "oui 🧪" : "non (réel)"}\n` +
+    `AMM only: ${isEnvOn("AUTO_BUY_AMM_ONLY", true) ? "oui" : "non"}`
+  );
+}
+
+async function registerTelegramCommands() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const commands = [
+    { command: "start", description: "Menu + boutons" },
+    { command: "help", description: "Toutes les commandes" },
+    { command: "status", description: "État du bot (RPC, wallets, autobuy)" },
+    { command: "wallets", description: "Liste des wallets suivis" },
+    { command: "add", description: "Ajouter: /add 0x... [label]" },
+    { command: "label", description: "Renommer: /label 0x... Nom" },
+    { command: "remove", description: "Retirer: /remove 0x..." },
+    { command: "alerts", description: "Dernières alertes" },
+    { command: "balance", description: "Balance ETH d'un wallet" },
+    { command: "buy", description: "Achat manuel: /buy 0xTOKEN [ETH]" },
+    { command: "autobuy", description: "Auto-buy: /autobuy on|off" },
+    { command: "amount", description: "Montant auto: /amount 0.001" },
+    { command: "slippage", description: "Slippage %: /slippage 3" },
+    { command: "tp", description: "Take-profit %: /tp 100" },
+    { command: "sl", description: "Stop-loss %: /sl 40 (0=off)" },
+    { command: "dryrun", description: "Dry-run: /dryrun on|off" },
+    { command: "config", description: "Config auto-buy" },
+    { command: "scan", description: "Scan hops/tokens: /scan 0x..." },
+    { command: "export", description: "Exporter adresses" },
+    { command: "ping", description: "Health check" },
+  ];
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMyCommands`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands }),
+      }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) console.log("[TELEGRAM] command menu registered");
+    else
+      console.warn(
+        `[TELEGRAM] setMyCommands: ${data.description || res.status}`
+      );
+  } catch (err) {
+    console.warn(`[TELEGRAM] setMyCommands failed: ${err.message}`);
+  }
+}
+
+/** Inline buttons for wallet list (max ~8 to stay readable) */
+function walletsInlineKeyboard() {
+  const list = [...trackedWallets];
+  const rows = [];
+  for (const a of list.slice(0, 12)) {
+    const label = walletMeta.get(a)?.label;
+    const short = label
+      ? `${label.slice(0, 16)}`
+      : `${a.slice(0, 6)}…${a.slice(-4)}`;
+    rows.push([
+      { text: `🔎 ${short}`, callback_data: `in:${a}` },
+      { text: "🏷️", callback_data: `lb:${a}` },
+      { text: "🗑", callback_data: `rm:${a}` },
+    ]);
+  }
+  rows.push([
+    { text: "➕ Ajouter wallet", callback_data: "menu:add" },
+    { text: "🔄 Refresh", callback_data: "menu:wallets" },
+  ]);
+  return { inline_keyboard: rows };
+}
+
+function walletDetailKeyboard(address) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🏷️ Renommer", callback_data: `lb:${address}` },
+        { text: "💰 Balance", callback_data: `bal:${address}` },
+      ],
+      [
+        { text: "🗑 Retirer", callback_data: `rm:${address}` },
+        { text: "« Liste", callback_data: "menu:wallets" },
+      ],
+    ],
+  };
+}
+
 /**
- * Send a text message to the configured Telegram chat (or a specific chatId).
+ * Send a text message (optional reply_markup: reply or inline keyboard).
  */
-async function sendTelegram(text, chatId = TELEGRAM_CHAT_ID) {
+async function sendTelegram(text, chatId = TELEGRAM_CHAT_ID, extra = {}) {
   if (!TELEGRAM_BOT_TOKEN || !chatId) return false;
   try {
+    const body = {
+      chat_id: chatId,
+      text: String(text).slice(0, 4000),
+      disable_web_page_preview: true,
+      ...extra,
+    };
     const res = await fetch(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: String(text).slice(0, 4000),
-          disable_web_page_preview: true,
-        }),
+        body: JSON.stringify(body),
       }
     );
     const data = await res.json().catch(() => ({}));
@@ -1588,144 +2152,729 @@ async function sendTelegram(text, chatId = TELEGRAM_CHAT_ID) {
   }
 }
 
+async function answerCallback(callbackQueryId, text = "") {
+  try {
+    await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: callbackQueryId,
+          text: text.slice(0, 200),
+          show_alert: false,
+        }),
+      }
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+function isAuthorizedChat(chatId) {
+  if (!TELEGRAM_CHAT_ID) return true;
+  return String(chatId) === String(TELEGRAM_CHAT_ID);
+}
+
+async function tgShowHelp(chatId) {
+  await sendTelegram(
+    `🤖 Robinhood Wallet Tracker — commandes\n\n` +
+      `📌 Suivi\n` +
+      `/add 0x... [label] — suivre un wallet\n` +
+      `/wallets — liste + boutons\n` +
+      `/label 0x... Nom — renommer\n` +
+      `/remove 0x... — arrêter le suivi\n` +
+      `/balance 0x... — solde ETH\n` +
+      `/scan 0x... — scan hops / tokens (si vide)\n` +
+      `/export — copier toutes les adresses\n\n` +
+      `🚨 Alertes\n` +
+      `/alerts — derniers events\n` +
+      `/status — état bot + RPC + autobuy\n` +
+      `/ping — health\n\n` +
+      `🛒 Trading auto\n` +
+      `/buy 0xTOKEN [montantETH] — achat manuel\n` +
+      `/autobuy on|off — activer achat auto au launch\n` +
+      `/amount 0.001 — ETH par auto-buy\n` +
+      `/slippage 3 — slippage %\n` +
+      `/tp 100 — take-profit % (100=x2)\n` +
+      `/sl 40 — stop-loss % (vend si -40%, 0=off)\n` +
+      `/dryrun on|off — simuler sans broadcast\n` +
+      `/config — config auto-buy\n\n` +
+      `${autoBuyConfigText()}\n\n` +
+      `Astuce: envoie juste 0x... pour ajouter un wallet.\n` +
+      `Menu / en bas de l’écran pour les commandes.`,
+    chatId,
+    { reply_markup: mainReplyKeyboard() }
+  );
+}
+
+async function tgShowStatus(chatId) {
+  let rpcOk = "?";
+  let chain = "?";
+  try {
+    const id = await alchemyRpc("eth_chainId", []);
+    chain = String(Number(id));
+    rpcOk = "OK";
+  } catch (e) {
+    rpcOk = `ERR ${e.message || e}`;
+  }
+  await sendTelegram(
+    `📊 STATUS\n\n` +
+      `RPC: ${rpcOk} (chain ${chain})\n` +
+      `Wallets: ${trackedWallets.size}\n` +
+      `Mode: ${webhooksSupported === true ? "webhook+polling" : "polling"}\n` +
+      `Webhook: ${addressActivityWebhookId || "—"}\n` +
+      `Port: ${PORT}\n` +
+      `Network: ${ROBINHOOD_NETWORK_SLUG}\n\n` +
+      `${autoBuyConfigText()}`,
+    chatId,
+    { reply_markup: mainReplyKeyboard() }
+  );
+}
+
+async function tgShowConfig(chatId) {
+  const cur = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
+  await sendTelegram(
+    `⚙️ CONFIG\n\n${autoBuyConfigText()}\n\n` +
+      `💵 Montant achat : ${cur} ETH\n\n` +
+      `Changer:\n` +
+      `/amount 0.001\n` +
+      `/autobuy on|off\n` +
+      `/slippage 3\n` +
+      `/tp 100 · /sl 40\n` +
+      `/dryrun on|off`,
+    chatId,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🛒 ON", callback_data: "cfg:buy:on" },
+            { text: "⏸ OFF", callback_data: "cfg:buy:off" },
+          ],
+          [
+            { text: "🧪 Dry ON", callback_data: "cfg:dry:on" },
+            { text: "🔥 Dry OFF", callback_data: "cfg:dry:off" },
+          ],
+          [
+            { text: "💵 0.001", callback_data: "cfg:amt:0.001" },
+            { text: "💵 0.005", callback_data: "cfg:amt:0.005" },
+            { text: "💵 0.01", callback_data: "cfg:amt:0.01" },
+          ],
+          [
+            { text: "💵 0.02", callback_data: "cfg:amt:0.02" },
+            { text: "💵 0.05", callback_data: "cfg:amt:0.05" },
+            { text: "💵 0.1", callback_data: "cfg:amt:0.1" },
+          ],
+          [{ text: "✏️ Autre montant", callback_data: "cfg:amt:custom" }],
+          [
+            { text: "SL 30%", callback_data: "cfg:sl:30" },
+            { text: "SL 40%", callback_data: "cfg:sl:40" },
+            { text: "SL 50%", callback_data: "cfg:sl:50" },
+            { text: "SL off", callback_data: "cfg:sl:0" },
+          ],
+          [{ text: "📊 Status", callback_data: "menu:status" }],
+        ],
+      },
+    }
+  );
+}
+
+async function tgShowBalance(chatId, address) {
+  try {
+    const a = normalizeAddress(address);
+    const bal = ethers.formatEther(await provider.getBalance(a));
+    const tracked = trackedWallets.has(a) ? "oui" : "non";
+    await sendTelegram(
+      `💰 Balance\n` +
+        `${walletLine(a)}\n\n` +
+        `${bal} ETH\n` +
+        `suivi: ${tracked}`,
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
+    );
+  } catch (err) {
+    await sendTelegram(`❌ ${err.message || err}`, chatId);
+  }
+}
+
+/** Manual buy (forces enable + optional amount for this call only) */
+async function tgManualBuy(chatId, token, amountEth) {
+  const amt = amountEth || process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
+  const prevAmt = process.env.AUTO_BUY_ETH_AMOUNT;
+  const prevEnabled = process.env.AUTO_BUY_ENABLED;
+  process.env.AUTO_BUY_ENABLED = "true";
+  process.env.AUTO_BUY_ETH_AMOUNT = String(amt);
+  try {
+    const { boughtTokens } = require("./auto-buy");
+    boughtTokens.delete(String(token).toLowerCase());
+    await sendTelegram(
+      `🛒 Achat manuel…\n${token}\n${amt} ETH`,
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
+    );
+    const result = await maybeAutoBuyToken({
+      tokenAddress: token,
+      symbol: "MANUAL",
+      name: "Manual buy",
+      launchpad: true,
+      isErc20Like: true,
+      fromCreate: true,
+      notify: (msg) =>
+        sendTelegram(msg, chatId, { reply_markup: mainReplyKeyboard() }),
+    });
+    if (result?.skipped) {
+      await sendTelegram(
+        `ℹ️ Buy skip: ${result.reason}` +
+          (result.reason === "bot-missing"
+            ? "\nVérifie UNISWAP_BOT_PATH"
+            : ""),
+        chatId
+      );
+    }
+  } catch (err) {
+    await sendTelegram(`❌ Buy failed: ${err.message || err}`, chatId);
+  } finally {
+    if (prevAmt !== undefined) process.env.AUTO_BUY_ETH_AMOUNT = prevAmt;
+    if (prevEnabled !== undefined) process.env.AUTO_BUY_ENABLED = prevEnabled;
+  }
+}
+
+async function tgShowWallets(chatId) {
+  const list = [...trackedWallets];
+  if (list.length === 0) {
+    await sendTelegram(
+      "Aucun wallet suivi.\nAppuie sur ➕ Ajouter ou envoie une adresse 0x...",
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
+    );
+    return;
+  }
+  const body = list
+    .map((a, i) => {
+      const m = walletMeta.get(a) || {};
+      const tag = m.label ? `🏷️ ${m.label}` : "—";
+      return `${i + 1}. ${tag}\n   \`${a}\``;
+    })
+    .join("\n\n");
+  await sendTelegram(
+    `📋 Wallets suivis (${list.length})\n\n${body}\n\n` +
+      `mode=${webhooksSupported === true ? "webhook" : "polling"}`,
+    chatId,
+    { reply_markup: walletsInlineKeyboard() }
+  );
+}
+
+async function tgShowAlerts(chatId) {
+  try {
+    if (!fs.existsSync(ALERTS_LOG_PATH)) {
+      await sendTelegram("Aucune alerte pour l’instant.", chatId, {
+        reply_markup: mainReplyKeyboard(),
+      });
+      return;
+    }
+    const lines = fs
+      .readFileSync(ALERTS_LOG_PATH, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .slice(-10)
+      .reverse();
+    if (lines.length === 0) {
+      await sendTelegram("Aucune alerte pour l’instant.", chatId, {
+        reply_markup: mainReplyKeyboard(),
+      });
+      return;
+    }
+    const parts = lines.map((line, i) => {
+      try {
+        const a = JSON.parse(line);
+        if (a.type === "TOKEN_DEPLOY") {
+          return (
+            `${i + 1}. 🪙 TOKEN ${a.symbol || "?"} (${a.name || "?"})\n` +
+            `   ${a.contractAddress}\n` +
+            `   by ${walletDisplay(a.deployer)}`
+          );
+        }
+        if (a.type === "NEW_WALLET" || a.direction === undefined && a.new) {
+          return `${i + 1}. 🆕 ${a.new || a.address}`;
+        }
+        const dir = a.direction === "IN" ? "⬅️ REÇU" : "➡️ ENVOYÉ";
+        return (
+          `${i + 1}. ${dir} ${a.value} ${a.asset}\n` +
+          `   ${walletDisplay(a.wallet)}\n` +
+          `   ${a.from} → ${a.to}`
+        );
+      } catch {
+        return `${i + 1}. ${line.slice(0, 120)}`;
+      }
+    });
+    await sendTelegram(`🚨 Dernières alertes\n\n${parts.join("\n\n")}`, chatId, {
+      reply_markup: mainReplyKeyboard(),
+    });
+  } catch (err) {
+    await sendTelegram(`❌ ${err.message || err}`, chatId);
+  }
+}
+
+async function tgShowWalletInfo(chatId, address) {
+  const a = address.toLowerCase();
+  if (!trackedWallets.has(a)) {
+    await sendTelegram("Wallet non suivi.", chatId);
+    return;
+  }
+  const m = walletMeta.get(a) || {};
+  let bal = "?";
+  try {
+    bal = ethers.formatEther(await provider.getBalance(a));
+  } catch {
+    /* */
+  }
+  await sendTelegram(
+    `🔎 Détail wallet\n\n` +
+      `🏷️ Label : ${m.label || "(aucun)"}\n` +
+      `Adresse : ${a}\n` +
+      `Balance : ${bal} ETH\n` +
+      `Source : ${m.source || "—"}\n` +
+      `Parent : ${m.parent || "—"}\n` +
+      `Ajouté : ${m.addedAt || "—"}`,
+    chatId,
+    { reply_markup: walletDetailKeyboard(a) }
+  );
+}
+
+async function tgPromptAdd(chatId) {
+  tgPending.set(String(chatId), { action: "add" });
+  await sendTelegram(
+    "➕ Envoie l’adresse du wallet à suivre\n" +
+      "Format : `0x...`\n" +
+      "Ou : `0x... MonLabel`",
+    chatId,
+    { reply_markup: mainReplyKeyboard() }
+  );
+}
+
+async function tgPromptLabel(chatId, address) {
+  tgPending.set(String(chatId), { action: "label", address });
+  await sendTelegram(
+    `🏷️ Nouveau nom pour\n${address}\n\nEnvoie le label (ex: Whale1, Drain3) :`,
+    chatId
+  );
+}
+
 /**
- * Handle one incoming Telegram message (commands only from allowed chat).
+ * Handle inline button presses.
+ */
+async function handleTelegramCallback(cq) {
+  const chatId = String(cq.message?.chat?.id ?? "");
+  const data = cq.data || "";
+  const qid = cq.id;
+
+  if (!isAuthorizedChat(chatId)) {
+    await answerCallback(qid, "Non autorisé");
+    return;
+  }
+
+  console.log(`[TELEGRAM] callback ${data}`);
+
+  if (data === "menu:wallets") {
+    await answerCallback(qid);
+    await tgShowWallets(chatId);
+    return;
+  }
+  if (data === "menu:alerts") {
+    await answerCallback(qid);
+    await tgShowAlerts(chatId);
+    return;
+  }
+  if (data === "menu:add") {
+    await answerCallback(qid, "Envoie une adresse");
+    await tgPromptAdd(chatId);
+    return;
+  }
+  if (data === "menu:help") {
+    await answerCallback(qid);
+    await tgShowHelp(chatId);
+    return;
+  }
+  if (data === "menu:status") {
+    await answerCallback(qid);
+    await tgShowStatus(chatId);
+    return;
+  }
+  if (data === "menu:config") {
+    await answerCallback(qid);
+    await tgShowConfig(chatId);
+    return;
+  }
+  if (data.startsWith("cfg:buy:")) {
+    const on = data.endsWith(":on");
+    setEnvRuntime("AUTO_BUY_ENABLED", on ? "true" : "false");
+    await answerCallback(qid, on ? "Auto-buy ON" : "Auto-buy OFF");
+    await tgShowConfig(chatId);
+    return;
+  }
+  if (data.startsWith("cfg:dry:")) {
+    const on = data.endsWith(":on");
+    setEnvRuntime("AUTO_BUY_DRY_RUN", on ? "true" : "false");
+    await answerCallback(qid, on ? "Dry-run ON" : "Dry-run OFF");
+    await tgShowConfig(chatId);
+    return;
+  }
+  if (data === "menu:amount") {
+    await answerCallback(qid);
+    await tgShowAmount(chatId);
+    return;
+  }
+  if (data.startsWith("cfg:amt:")) {
+    const amt = data.slice("cfg:amt:".length);
+    if (amt === "custom") {
+      tgPending.set(String(chatId), { action: "amount" });
+      await answerCallback(qid, "Envoie le montant");
+      await sendTelegram(
+        "✏️ Envoie le montant ETH (ex: 0.003 ou 0.015)",
+        chatId
+      );
+      return;
+    }
+    setEnvRuntime("AUTO_BUY_ETH_AMOUNT", amt);
+    await answerCallback(qid, `${amt} ETH`);
+    await sendTelegram(
+      `✅ Montant d’achat = ${amt} ETH\n\n${autoBuyConfigText()}`,
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
+    );
+    return;
+  }
+  // Quick buy from token alert: buy:0.001:0x... or buy:cfg:0x...
+  if (data.startsWith("buy:")) {
+    const rest = data.slice(4);
+    const parts = rest.split(":");
+    if (parts.length >= 2) {
+      const amtKey = parts[0];
+      const token = parts.slice(1).join(":");
+      const amt =
+        amtKey === "cfg"
+          ? process.env.AUTO_BUY_ETH_AMOUNT || "0.001"
+          : amtKey;
+      await answerCallback(qid, `Buy ${amt} ETH`);
+      if (!/^0x[a-f0-9]{40}$/.test(token)) {
+        await sendTelegram("❌ Token invalide", chatId);
+        return;
+      }
+      await tgManualBuy(chatId, token, amt);
+      return;
+    }
+  }
+  if (data.startsWith("cfg:sl:")) {
+    const sl = data.slice("cfg:sl:".length);
+    setEnvRuntime("AUTO_BUY_STOP_LOSS", sl);
+    try {
+      const botEnv = path.join(
+        process.env.UNISWAP_BOT_PATH ||
+          path.resolve(__dirname, "..", "robinhood-uniswap-bot"),
+        ".env"
+      );
+      if (fs.existsSync(botEnv)) {
+        let t = fs.readFileSync(botEnv, "utf8");
+        if (/^STOP_LOSS_PCT=/m.test(t)) {
+          t = t.replace(/^STOP_LOSS_PCT=.*$/m, `STOP_LOSS_PCT=${sl}`);
+        } else {
+          t = t.trimEnd() + `\nSTOP_LOSS_PCT=${sl}\n`;
+        }
+        fs.writeFileSync(botEnv, t);
+      }
+    } catch {
+      /* */
+    }
+    await answerCallback(
+      qid,
+      Number(sl) > 0 ? `SL -${sl}%` : "SL off"
+    );
+    await tgShowConfig(chatId);
+    return;
+  }
+
+  if (data.startsWith("in:")) {
+    const addr = data.slice(3);
+    await answerCallback(qid);
+    await tgShowWalletInfo(chatId, addr);
+    return;
+  }
+  if (data.startsWith("lb:")) {
+    const addr = data.slice(3);
+    await answerCallback(qid, "Envoie le label");
+    await tgPromptLabel(chatId, addr);
+    return;
+  }
+  if (data.startsWith("bal:")) {
+    const addr = data.slice(4);
+    await answerCallback(qid);
+    try {
+      const bal = ethers.formatEther(await provider.getBalance(addr));
+      await sendTelegram(
+        `💰 ${walletDisplay(addr)}\n${addr}\n\nBalance : ${bal} ETH`,
+        chatId,
+        { reply_markup: walletDetailKeyboard(addr) }
+      );
+    } catch (err) {
+      await sendTelegram(`❌ ${err.message || err}`, chatId);
+    }
+    return;
+  }
+  if (data.startsWith("rm:")) {
+    const addr = data.slice(3);
+    try {
+      const r = await removeWallet(addr);
+      await answerCallback(qid, r.removed ? "Retiré" : "Introuvable");
+      await sendTelegram(
+        r.removed
+          ? `🗑 Retiré\n${addr}\nTotal : ${trackedWallets.size}`
+          : `Wallet déjà absent.`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+      if (r.removed) await tgShowWallets(chatId);
+    } catch (err) {
+      await answerCallback(qid, "Erreur");
+      await sendTelegram(`❌ ${err.message || err}`, chatId);
+    }
+    return;
+  }
+
+  await answerCallback(qid, "Action inconnue");
+}
+
+/**
+ * Handle one incoming Telegram message (commands + buttons + pending).
  */
 async function handleTelegramMessage(msg) {
   const chatId = String(msg.chat?.id ?? "");
   const text = (msg.text || "").trim();
   if (!text) return;
 
-  // Security: only the configured chat can control the bot
-  if (String(TELEGRAM_CHAT_ID) && chatId !== String(TELEGRAM_CHAT_ID)) {
-    console.warn(
-      `[TELEGRAM] ignored message from unauthorized chat ${chatId}`
-    );
+  if (!isAuthorizedChat(chatId)) {
+    console.warn(`[TELEGRAM] ignored unauthorized chat ${chatId}`);
+    await sendTelegram("⛔ Chat non autorisé pour ce bot tracker.", chatId);
+    return;
+  }
+
+  // Reply-keyboard button labels (exact match)
+  if (text === "📋 Wallets" || text === "Wallets") {
+    await tgShowWallets(chatId);
+    return;
+  }
+  if (text === "🚨 Alertes" || text === "Alertes") {
+    await tgShowAlerts(chatId);
+    return;
+  }
+  if (text === "📊 Status" || text === "Status") {
+    await tgShowStatus(chatId);
+    return;
+  }
+  if (text === "➕ Ajouter" || text === "Ajouter") {
+    await tgPromptAdd(chatId);
+    return;
+  }
+  if (text === "🛒 AutoBuy" || text === "AutoBuy") {
+    await tgShowConfig(chatId);
+    return;
+  }
+  // Button shows current amount e.g. "💵 0.001 ETH"
+  if (
+    text === "💵 Montant" ||
+    text.startsWith("💵 ") ||
+    text === "Montant"
+  ) {
+    await tgShowAmount(chatId);
+    return;
+  }
+  if (text === "💰 Balance" || text === "Balance") {
+    tgPending.set(String(chatId), { action: "balance" });
     await sendTelegram(
-      "⛔ Chat non autorisé pour ce bot tracker.",
+      "💰 Envoie l’adresse 0x... pour voir la balance ETH\n" +
+        "(ou /balance 0x...)",
       chatId
+    );
+    return;
+  }
+  if (text === "⚙️ Config" || text === "Config") {
+    await tgShowConfig(chatId);
+    return;
+  }
+  if (text === "🏷️ Labels" || text === "Labels") {
+    await tgShowWallets(chatId);
+    await sendTelegram(
+      "Appuie sur 🏷️ à côté d’un wallet pour le renommer.\n" +
+        "Ou : /label 0x... MonNom",
+      chatId
+    );
+    return;
+  }
+  if (text === "ℹ️ Aide" || text === "Aide") {
+    await tgShowHelp(chatId);
+    return;
+  }
+
+  // Pending multi-step (add / label)
+  const pending = tgPending.get(String(chatId));
+  if (pending?.action === "label") {
+    tgPending.delete(String(chatId));
+    try {
+      const meta = setWalletLabel(pending.address, text);
+      await sendTelegram(
+        `✅ Label enregistré\n🏷️ ${meta.label}\n${meta.address}`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+      await tgShowWalletInfo(chatId, meta.address);
+    } catch (err) {
+      await sendTelegram(`❌ ${err.message || err}`, chatId);
+    }
+    return;
+  }
+  if (pending?.action === "add") {
+    const m = text.match(/^(0x[a-fA-F0-9]{40})(?:\s+(.+))?$/);
+    if (!m) {
+      await sendTelegram(
+        "Format invalide. Envoie :\n0xTonAdresse\nou\n0xTonAdresse MonLabel",
+        chatId
+      );
+      return;
+    }
+    tgPending.delete(String(chatId));
+    try {
+      const result = await addWallet(m[1], {
+        source: "telegram",
+        label: m[2] || "",
+      });
+      await sendTelegram(
+        result.alreadyTracked
+          ? `ℹ️ Déjà suivi\n${walletLine(result.address)}`
+          : `✅ Ajouté\n${walletLine(result.address)}\nTotal : ${trackedWallets.size}`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+    } catch (err) {
+      await sendTelegram(`❌ ${err.message || err}`, chatId);
+    }
+    return;
+  }
+  if (pending?.action === "balance") {
+    const m = text.match(/^(0x[a-fA-F0-9]{40})$/);
+    if (!m) {
+      await sendTelegram("Envoie une adresse 0x… valide", chatId);
+      return;
+    }
+    tgPending.delete(String(chatId));
+    await tgShowBalance(chatId, m[1]);
+    return;
+  }
+  if (pending?.action === "amount") {
+    const m = text.replace(",", ".").match(/^([0-9]*\.?[0-9]+)$/);
+    if (!m || Number(m[1]) <= 0) {
+      await sendTelegram(
+        "Montant invalide. Exemple : 0.001 ou 0.025",
+        chatId
+      );
+      return;
+    }
+    tgPending.delete(String(chatId));
+    setEnvRuntime("AUTO_BUY_ETH_AMOUNT", m[1]);
+    await sendTelegram(
+      `✅ Montant d’achat = ${m[1]} ETH\n\n${autoBuyConfigText()}`,
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
     );
     return;
   }
 
   const [cmdRaw, ...args] = text.split(/\s+/);
-  const cmd = cmdRaw.toLowerCase().split("@")[0]; // /add@botname → /add
+  const cmd = cmdRaw.toLowerCase().split("@")[0];
 
   console.log(`[TELEGRAM] cmd=${cmd} args=${args.join(" ")}`);
 
-  if (cmd === "/start" || cmd === "/help") {
+  if (cmd === "/start") {
     await sendTelegram(
-      `🤖 Robinhood Wallet Tracker\n\n` +
-        `Commandes :\n` +
-        `/add 0x... — ajouter un wallet\n` +
-        `/wallets — lister les wallets suivis\n` +
-        `/alerts — dernières alertes\n` +
-        `/help — cette aide\n\n` +
-        `Tu reçois aussi auto les alertes transferts + tokens.`,
-      chatId
+      `🟢 Tracker prêt\n${trackedWallets.size} wallet(s)\n\n${autoBuyConfigText()}`,
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
+    );
+    await tgShowHelp(chatId);
+    return;
+  }
+  if (cmd === "/help") {
+    await tgShowHelp(chatId);
+    return;
+  }
+  if (cmd === "/status" || cmd === "/info") {
+    await tgShowStatus(chatId);
+    return;
+  }
+  if (cmd === "/ping") {
+    await sendTelegram("pong ✅ bot vivant", chatId, {
+      reply_markup: mainReplyKeyboard(),
+    });
+    return;
+  }
+  if (cmd === "/config") {
+    await tgShowConfig(chatId);
+    return;
+  }
+  if (cmd === "/export") {
+    const list = [...trackedWallets];
+    if (!list.length) {
+      await sendTelegram("Aucun wallet.", chatId);
+      return;
+    }
+    await sendTelegram(
+      `📤 Export (${list.length})\n\n` + list.join("\n"),
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
     );
     return;
   }
 
   if (cmd === "/add") {
     const address = args[0];
+    const label = args.slice(1).join(" ");
     if (!address) {
-      await sendTelegram(
-        "Usage : /add 0xTonWallet\nExemple : /add 0x67A64dB3...",
-        chatId
-      );
+      await tgPromptAdd(chatId);
       return;
     }
     try {
-      const result = await addWallet(address, { source: "telegram" });
-      if (result.alreadyTracked) {
-        await sendTelegram(
-          `ℹ️ Déjà suivi\n${result.address}\nTotal : ${trackedWallets.size}`,
-          chatId
-        );
-      } else {
-        await sendTelegram(
-          `✅ Wallet ajouté\n${result.address}\nTotal : ${trackedWallets.size}\nMode : ${
-            webhooksSupported === true ? "webhook" : "polling"
-          }`,
-          chatId
-        );
-      }
+      const result = await addWallet(address, {
+        source: "telegram",
+        label,
+      });
+      await sendTelegram(
+        result.alreadyTracked
+          ? `ℹ️ Déjà suivi\n${walletLine(result.address)}`
+          : `✅ Ajouté\n${walletLine(result.address)}\nTotal : ${trackedWallets.size}`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
     } catch (err) {
       await sendTelegram(`❌ Erreur : ${err.message || err}`, chatId);
     }
     return;
   }
 
-  if (cmd === "/wallets" || cmd === "/list") {
-    const list = [...trackedWallets];
-    if (list.length === 0) {
-      await sendTelegram("Aucun wallet suivi. Utilise /add 0x...", chatId);
+  if (cmd === "/label" || cmd === "/name") {
+    const address = args[0];
+    const label = args.slice(1).join(" ");
+    if (!address || !label) {
+      await sendTelegram(
+        "Usage : /label 0x... MonNom\nExemple : /label 0x3bf7... Drain4",
+        chatId
+      );
       return;
     }
-    const body = list.map((a, i) => `${i + 1}. ${a}`).join("\n");
-    await sendTelegram(
-      `📋 Wallets suivis (${list.length})\n\n${body}\n\n` +
-        `mode=${webhooksSupported === true ? "webhook" : "polling"} ` +
-        `webhook=${addressActivityWebhookId || "—"}`,
-      chatId
-    );
-    return;
-  }
-
-  if (cmd === "/alerts") {
     try {
-      if (!fs.existsSync(ALERTS_LOG_PATH)) {
-        await sendTelegram("Aucune alerte pour l’instant.", chatId);
-        return;
-      }
-      const lines = fs
-        .readFileSync(ALERTS_LOG_PATH, "utf8")
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .slice(-10)
-        .reverse();
-      if (lines.length === 0) {
-        await sendTelegram("Aucune alerte pour l’instant.", chatId);
-        return;
-      }
-      const parts = lines.map((line, i) => {
-        try {
-          const a = JSON.parse(line);
-          if (a.type === "TOKEN_DEPLOY") {
-            return (
-              `${i + 1}. 🪙 TOKEN ${a.symbol || "?"} (${a.name || "?"})\n` +
-              `   ${a.contractAddress}\n` +
-              `   by ${a.deployer}`
-            );
-          }
-          const dir = a.direction === "IN" ? "⬅️ REÇU" : "➡️ ENVOYÉ";
-          return (
-            `${i + 1}. ${dir} ${a.value} ${a.asset}\n` +
-            `   ${a.from} → ${a.to}\n` +
-            `   wallet ${a.wallet}`
-          );
-        } catch {
-          return `${i + 1}. ${line.slice(0, 120)}`;
-        }
-      });
-      await sendTelegram(`🚨 Dernières alertes\n\n${parts.join("\n\n")}`, chatId);
-    } catch (err) {
-      await sendTelegram(`❌ ${err.message || err}`, chatId);
-    }
-    return;
-  }
-
-  // Bare 0x address → treat as /add
-  if (/^0x[a-fA-F0-9]{40}$/.test(cmdRaw)) {
-    try {
-      const result = await addWallet(cmdRaw, { source: "telegram" });
+      const meta = setWalletLabel(address, label);
       await sendTelegram(
-        result.alreadyTracked
-          ? `ℹ️ Déjà suivi\n${result.address}`
-          : `✅ Ajouté\n${result.address}\nTotal : ${trackedWallets.size}`,
-        chatId
+        `✅ Label OK\n🏷️ ${meta.label}\n${meta.address}`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
       );
     } catch (err) {
       await sendTelegram(`❌ ${err.message || err}`, chatId);
@@ -1733,12 +2882,250 @@ async function handleTelegramMessage(msg) {
     return;
   }
 
-  await sendTelegram("Commande inconnue. Envoie /help", chatId);
+  if (cmd === "/remove" || cmd === "/rm" || cmd === "/delete") {
+    const address = args[0];
+    if (!address) {
+      await sendTelegram("Usage : /remove 0x...", chatId);
+      return;
+    }
+    try {
+      const r = await removeWallet(address);
+      await sendTelegram(
+        r.removed
+          ? `🗑 Retiré\n${r.address}\nTotal : ${trackedWallets.size}`
+          : "Wallet non suivi.",
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+    } catch (err) {
+      await sendTelegram(`❌ ${err.message || err}`, chatId);
+    }
+    return;
+  }
+
+  if (cmd === "/wallets" || cmd === "/list") {
+    await tgShowWallets(chatId);
+    return;
+  }
+
+  if (cmd === "/alerts") {
+    await tgShowAlerts(chatId);
+    return;
+  }
+
+  if (cmd === "/balance" || cmd === "/bal") {
+    if (!args[0]) {
+      tgPending.set(String(chatId), { action: "balance" });
+      await sendTelegram("Envoie l’adresse 0x…", chatId);
+      return;
+    }
+    await tgShowBalance(chatId, args[0]);
+    return;
+  }
+
+  if (cmd === "/scan") {
+    if (!args[0]) {
+      await sendTelegram("Usage : /scan 0xWALLET", chatId);
+      return;
+    }
+    try {
+      const a = normalizeAddress(args[0]);
+      if (!trackedWallets.has(a)) {
+        await sendTelegram("Wallet non suivi. /add d’abord.", chatId);
+        return;
+      }
+      await sendTelegram(`🔎 Scan de ${a}…`, chatId);
+      await detectTokenDeploysAndNewWallets(a, []);
+      await sendTelegram(
+        `✅ Scan terminé pour\n${walletLine(a)}\nVoir /alerts`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+    } catch (err) {
+      await sendTelegram(`❌ ${err.message || err}`, chatId);
+    }
+    return;
+  }
+
+  if (cmd === "/buy") {
+    const token = args[0];
+    const amount = args[1];
+    if (!token || !/^0x[a-fA-F0-9]{40}$/.test(token)) {
+      await sendTelegram(
+        "Usage : /buy 0xTOKEN [montantETH]\nExemple : /buy 0x06feed… 0.001",
+        chatId
+      );
+      return;
+    }
+    await tgManualBuy(chatId, token, amount);
+    return;
+  }
+
+  if (cmd === "/autobuy") {
+    const v = (args[0] || "").toLowerCase();
+    if (v === "on" || v === "off") {
+      setEnvRuntime("AUTO_BUY_ENABLED", v === "on" ? "true" : "false");
+      await sendTelegram(
+        `🛒 Auto-buy ${v === "on" ? "ON ✅" : "OFF ⏸"}\n\n${autoBuyConfigText()}`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+    } else {
+      await sendTelegram(
+        `${autoBuyConfigText()}\n\nUsage : /autobuy on|off`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+    }
+    return;
+  }
+
+  if (cmd === "/amount" || cmd === "/montant") {
+    if (!args[0]) {
+      await tgShowAmount(chatId);
+      return;
+    }
+    const raw = String(args[0]).replace(",", ".");
+    if (Number(raw) <= 0 || Number.isNaN(Number(raw))) {
+      await sendTelegram(
+        `Montant actuel: ${process.env.AUTO_BUY_ETH_AMOUNT || "0.001"} ETH\n` +
+          `Usage : /amount 0.001`,
+        chatId
+      );
+      return;
+    }
+    setEnvRuntime("AUTO_BUY_ETH_AMOUNT", raw);
+    await sendTelegram(
+      `✅ Montant d’achat = ${raw} ETH\n\n` +
+        `Chaque auto-buy (et /buy sans montant) utilisera ${raw} ETH.`,
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
+    );
+    return;
+  }
+
+  if (cmd === "/slippage") {
+    if (!args[0] || Number(args[0]) <= 0) {
+      await sendTelegram(
+        `Slippage: ${process.env.AUTO_BUY_SLIPPAGE || "3"}%\nUsage : /slippage 3`,
+        chatId
+      );
+      return;
+    }
+    setEnvRuntime("AUTO_BUY_SLIPPAGE", args[0]);
+    await sendTelegram(`✅ Slippage = ${args[0]}%`, chatId, {
+      reply_markup: mainReplyKeyboard(),
+    });
+    return;
+  }
+
+  if (cmd === "/tp" || cmd === "/takeprofit") {
+    if (!args[0] || Number.isNaN(Number(args[0]))) {
+      await sendTelegram(
+        `Take-profit: +${process.env.AUTO_BUY_TAKE_PROFIT || "100"}%\n` +
+          `Usage : /tp 100  (100 = x2)`,
+        chatId
+      );
+      return;
+    }
+    setEnvRuntime("AUTO_BUY_TAKE_PROFIT", args[0]);
+    await sendTelegram(`✅ Take-profit = +${args[0]}%`, chatId, {
+      reply_markup: mainReplyKeyboard(),
+    });
+    return;
+  }
+
+  if (cmd === "/sl" || cmd === "/stoploss" || cmd === "/stop-loss") {
+    if (args[0] === undefined || Number.isNaN(Number(args[0]))) {
+      const cur = process.env.AUTO_BUY_STOP_LOSS || "40";
+      await sendTelegram(
+        `Stop-loss: ${Number(cur) > 0 ? `-${cur}%` : "off"}\n` +
+          `Usage : /sl 40  → vend si PnL ≤ -40%\n` +
+          `/sl 0   → désactiver`,
+        chatId
+      );
+      return;
+    }
+    const n = Math.abs(Number(args[0]));
+    setEnvRuntime("AUTO_BUY_STOP_LOSS", String(n));
+    // mirror for uniswap bot env if present
+    try {
+      const botEnv = path.join(
+        process.env.UNISWAP_BOT_PATH ||
+          path.resolve(__dirname, "..", "robinhood-uniswap-bot"),
+        ".env"
+      );
+      if (fs.existsSync(botEnv)) {
+        let t = fs.readFileSync(botEnv, "utf8");
+        if (/^STOP_LOSS_PCT=/m.test(t)) {
+          t = t.replace(/^STOP_LOSS_PCT=.*$/m, `STOP_LOSS_PCT=${n}`);
+        } else {
+          t = t.trimEnd() + `\nSTOP_LOSS_PCT=${n}\n`;
+        }
+        fs.writeFileSync(botEnv, t);
+      }
+    } catch {
+      /* ignore */
+    }
+    await sendTelegram(
+      n > 0
+        ? `🛑 Stop-loss = -${n}%\n(vend auto si perte ≥ ${n}%)`
+        : `Stop-loss désactivé`,
+      chatId,
+      { reply_markup: mainReplyKeyboard() }
+    );
+    return;
+  }
+
+  if (cmd === "/dryrun") {
+    const v = (args[0] || "").toLowerCase();
+    if (v === "on" || v === "off") {
+      setEnvRuntime("AUTO_BUY_DRY_RUN", v === "on" ? "true" : "false");
+      await sendTelegram(
+        `🧪 Dry-run ${v === "on" ? "ON (simulation)" : "OFF (achats réels)"}`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+    } else {
+      await sendTelegram(
+        `Dry-run: ${isEnvOn("AUTO_BUY_DRY_RUN") ? "ON" : "OFF"}\n` +
+          `Usage : /dryrun on|off`,
+        chatId
+      );
+    }
+    return;
+  }
+
+  // "0x... Label" or bare 0x → add wallet
+  const bare = text.match(/^(0x[a-fA-F0-9]{40})(?:\s+(.+))?$/);
+  if (bare) {
+    try {
+      const result = await addWallet(bare[1], {
+        source: "telegram",
+        label: bare[2] || "",
+      });
+      await sendTelegram(
+        result.alreadyTracked
+          ? `ℹ️ Déjà suivi\n${walletLine(result.address)}`
+          : `✅ Ajouté\n${walletLine(result.address)}\nTotal : ${trackedWallets.size}`,
+        chatId,
+        { reply_markup: mainReplyKeyboard() }
+      );
+    } catch (err) {
+      await sendTelegram(`❌ ${err.message || err}`, chatId);
+    }
+    return;
+  }
+
+  await sendTelegram(
+    "Commande inconnue.\n/help pour la liste · menu / en bas",
+    chatId,
+    { reply_markup: mainReplyKeyboard() }
+  );
 }
 
 /**
- * Long-poll Telegram getUpdates loop (commands).
- * Runs forever in the background while the server is up.
+ * Long-poll Telegram getUpdates (messages + button callbacks).
  */
 function startTelegramBot() {
   if (!TELEGRAM_BOT_TOKEN) {
@@ -1755,6 +3142,7 @@ function startTelegramBot() {
   console.log(
     `[TELEGRAM] bot polling started (chat=${TELEGRAM_CHAT_ID || "?"})`
   );
+  registerTelegramCommands().catch(() => {});
 
   const loop = async () => {
     try {
@@ -1766,7 +3154,9 @@ function startTelegramBot() {
       if (data.ok && Array.isArray(data.result)) {
         for (const upd of data.result) {
           offset = upd.update_id + 1;
-          if (upd.message) {
+          if (upd.callback_query) {
+            await handleTelegramCallback(upd.callback_query);
+          } else if (upd.message) {
             await handleTelegramMessage(upd.message);
           }
         }
@@ -1778,7 +3168,6 @@ function startTelegramBot() {
       console.error(`[TELEGRAM] poll error: ${err.message || err}`);
       await new Promise((r) => setTimeout(r, 3000));
     }
-    // continue
     setImmediate(loop);
   };
 
@@ -1823,12 +3212,41 @@ app.listen(PORT, async () => {
     );
   }
 
-  // Start Telegram command listener + notify that bot is online
+  // Restore personalized wallets from disk, then re-register tracking
+  const saved = loadWalletsDb();
+  if (saved.length > 0) {
+    console.log(`[TRACKER] Restoring ${saved.length} wallet(s) from disk...`);
+    for (const w of saved) {
+      try {
+        await addWallet(w.address, {
+          source: w.source || "restore",
+          label: w.label || "",
+          parent: w.parent || null,
+        });
+        if (w.note) {
+          ensureWalletMeta(normalizeAddress(w.address), { note: w.note });
+        }
+      } catch (err) {
+        console.error(
+          `[TRACKER] restore ${w.address} failed: ${err.message || err}`
+        );
+      }
+    }
+    saveWalletsDb();
+  }
+
   startTelegramBot();
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    sendTelegram(
-      `🟢 Tracker démarré (port ${PORT})\n` +
-        `Commandes : /add 0x... | /wallets | /alerts | /help`
-    ).catch(() => {});
+    // Delay so wallet restore can fill count a bit
+    setTimeout(() => {
+      sendTelegram(
+        `🟢 Tracker démarré (port ${PORT})\n` +
+          `${trackedWallets.size} wallet(s)\n` +
+          `${autoBuyConfigText()}\n\n` +
+          `Boutons 👇 · Commandes /help · Menu /`,
+        TELEGRAM_CHAT_ID,
+        { reply_markup: mainReplyKeyboard() }
+      ).catch(() => {});
+    }, 3000);
   }
 });

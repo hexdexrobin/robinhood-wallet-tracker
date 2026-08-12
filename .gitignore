@@ -12,9 +12,13 @@ alerts.log
 npm-debug.log*
 /tmp/
 
+# persisted wallet labels (local only)
+data/
+
 # OS / editor
 .DS_Store
 .idea/
 .vscode/
 *.swp
 *~
+logs/

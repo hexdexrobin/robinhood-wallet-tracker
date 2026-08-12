@@ -1,205 +1,83 @@
 # Robinhood Chain Wallet Tracker
 
-Node.js bot that tracks wallets on **Robinhood Chain** (EVM L2):
+Bot Node.js pour **suivre des wallets** sur **Robinhood Chain (chain ID 4663)**, détecter les **lancements de tokens**, les **drains**, et optionnellement **acheter auto** via [robinhood-uniswap-bot](https://github.com/hexdexrobin/robinhood-uniswap-bot).
 
-| Network | Chain ID |
-|---------|----------|
-| Mainnet | **4663** |
-| Testnet | **46630** |
+## Fonctionnalités
 
-This project targets **mainnet (4663)** via Alchemy + ethers.js v6.
-
-## What it does
-
-1. **`POST /add-wallet`** — start tracking an address.
-2. On add: fetch and log the wallet’s **last outgoing transfer** (`getAssetTransfers`: external, erc20, internal, descending, max 1).
-3. Register the address on an Alchemy **ADDRESS_ACTIVITY** webhook (create if needed, else append).
-4. On each activity event: check the **sender ETH balance** (`provider.getBalance`). Empty = **&lt; 0.001 ETH**.
-5. If empty: scan the last **10 outgoing external** txs. For each hash, load the receipt:
-   - `receipt.contractAddress` set → **token/contract deploy**
-   - `receipt.to` is an **EOA** (`getCode` → `0x`) and asset is ETH → **new wallet**
-6. Auto-add detected new wallets **recursively**.
-
-If ADDRESS_ACTIVITY is not available for Robinhood mainnet, the bot **falls back to polling** `getAssetTransfers` every **15 seconds**.
+- Suivi multi-wallets (webhook Alchemy + polling backup)
+- Alertes **ETH drain** + **token launch** (Telegram / Discord)
+- Auto-ajout du **dernier hop** seulement si le wallet source est **vide** (&lt; 0.001 ETH)
+- Décodage calldata (helper `0x5b8d85…`) pour le vrai destinataire
+- Labels personnalisés + persistance `data/wallets.json`
+- **Telegram** : boutons, commandes, auto-buy config
+- **Auto-buy** Uniswap (TP + **stop-loss**)
 
 ## Stack
 
-- **Express** — `POST /add-wallet`, `GET /wallets`, `POST /webhook`
-- **Alchemy SDK** — transfers + Notify webhooks (`Network.ROBINHOOD_MAINNET` when present, else `robinhood-mainnet`)
-- **ethers.js v6** — `JsonRpcProvider`, `formatEther`, `getBalance`, receipts, `getCode`
-- **In-memory storage** — `Set` of wallets + webhook id (see comment in `index.js` for Redis/Postgres)
+Express · ethers v6 · Alchemy JSON-RPC · Telegram Bot API · PM2 (prod)
 
-## Setup
-
-### 1. Install
+## Install local
 
 ```bash
+git clone https://github.com/hexdexrobin/robinhood-wallet-tracker.git
 cd robinhood-wallet-tracker
 npm install
-```
-
-### 2. Configure environment
-
-```bash
 cp .env.example .env
-```
-
-Edit `.env`:
-
-| Variable | Description |
-|----------|-------------|
-| `ALCHEMY_API_KEY` | API key from your Alchemy Robinhood app |
-| `ALCHEMY_AUTH_TOKEN` | Notify auth token (Alchemy Dashboard → Notify) |
-| `WEBHOOK_URL` | Public HTTPS URL pointing at `/webhook` (ngrok URL in local dev) |
-| `PORT` | Server port (default `3000`) |
-
-RPC used by the bot:
-
-```text
-https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}
-```
-
-### 3. Start the server
-
-```bash
+# éditer .env
 npm start
 ```
 
-## Expose the webhook locally with ngrok
+## Telegram (commandes principales)
 
-Alchemy must reach your machine over HTTPS.
+| Commande | Rôle |
+|----------|------|
+| `/start` `/help` | Menu |
+| `/wallets` `/add` `/label` `/remove` | Suivi |
+| `/alerts` `/status` `/balance` | Monitoring |
+| `/buy 0xTOKEN [ETH]` | Achat manuel |
+| `/autobuy on\|off` | Achat auto au launch |
+| `/amount 0.001` | Montant d’achat |
+| `/tp 100` `/sl 40` | Take-profit / stop-loss |
+| `/dryrun on\|off` | Simulation |
+| `/config` | Config trading |
 
-```bash
-# terminal 1
-npm start
+Boutons : Wallets · Alertes · Status · Ajouter · AutoBuy · Montant ETH · Config · Balance · Aide
 
-# terminal 2
-ngrok http 3000
-```
-
-Copy the ngrok HTTPS URL and set:
-
-```env
-WEBHOOK_URL=https://<your-subdomain>.ngrok-free.app/webhook
-```
-
-Restart the bot so it uses the new URL when creating/updating the Alchemy webhook.
-
-> Tip: free ngrok URLs change on restart — update `.env` and re-add a wallet (or recreate the webhook) after each ngrok session.
-
-## API usage
-
-### Add a wallet (CLI)
-
-With the bot running (`npm start` in another terminal):
+## CLI
 
 ```bash
-# one wallet
-npm run add -- 0xYourWalletAddressHere
-
-# several wallets
-npm run add -- 0xAAA... 0xBBB...
-
-# list tracked wallets
+npm run add -- 0xWALLET
 npm run wallets
+npm run alerts
 ```
 
-Or with curl:
+## Deploy production (Spaceship)
+
+Voir **[DEPLOY.md](./DEPLOY.md)** — Nginx HTTPS, PM2, variables d’env, auto-buy.
 
 ```bash
-curl -X POST http://localhost:3000/add-wallet \
-  -H "Content-Type: application/json" \
-  -d '{"address":"0xYourWalletAddressHere"}'
+pm2 start ecosystem.config.cjs
+pm2 save && pm2 startup
 ```
 
-Example success response:
-
-```json
-{
-  "ok": true,
-  "address": "0x...",
-  "alreadyTracked": false,
-  "trackedCount": 1,
-  "webhookId": "wh_...",
-  "mode": "webhook"
-}
-```
-
-`mode` is `"polling"` if ADDRESS_ACTIVITY registration failed and the 15s poller is active.
-
-### List tracked wallets
-
-```bash
-curl http://localhost:3000/wallets
-```
-
-### Webhook receiver (Alchemy → bot)
-
-```bash
-# Alchemy POSTs here automatically; manual smoke test:
-curl -X POST http://localhost:3000/webhook \
-  -H "Content-Type: application/json" \
-  -d '{"event":{"activity":[]}}'
-```
-
-The route **always responds `200` immediately**, then runs balance/detection logic asynchronously.
-
-### Health
-
-```bash
-curl http://localhost:3000/health
-```
-
-## Log prefixes
-
-| Prefix | Meaning |
-|--------|---------|
-| `[TRACKER]` | Wallet add, last transfer, webhook setup |
-| `[WEBHOOK]` | Incoming Notify events |
-| `[BALANCE]` | ETH balance checks |
-| `[DETECT]` | Empty-wallet scan of recent txs |
-| `[NEW WALLET]` | Detected EOA recipient + auto-add |
-| `[TOKEN DEPLOY]` | Contract creation from empty wallet |
-| `[POLLING]` | 15s fallback mode |
-
-## Project layout
+## Structure
 
 ```text
-robinhood-wallet-tracker/
-├── index.js        # entire bot (single file)
-├── package.json
-├── .env.example
-└── README.md
+index.js              # serveur + tracker + telegram
+auto-buy.js           # pont → robinhood-uniswap-bot
+add-wallet.sh         # CLI add
+list-wallets.sh       # CLI list
+ecosystem.config.cjs  # PM2
+data/wallets.json     # persistance (gitignored)
+logs/                 # logs auto-buy / pm2 (gitignored)
 ```
 
-## Production notes
+## Sécurité
 
-- Replace the in-memory `trackedWallets` `Set` and `addressActivityWebhookId` with **Redis** or **Postgres** (search for `PRODUCTION STORAGE` in `index.js`).
-- Keep `WEBHOOK_URL` on a stable public host (not a disposable ngrok URL).
-- Protect `/webhook` if you expose it publicly (Alchemy signing secret verification is a good next step).
-- ethers.js **v6 only** (`ethers.formatEther`, `ethers.JsonRpcProvider`).
+- Ne jamais committer `.env`
+- Wallet de trading dédié, petit budget
+- `AUTO_BUY_DRY_RUN=true` avant la prod
 
-## License
+## Licence
 
-MIT
-
-
-## Telegram
-
-Set in `.env`:
-
-```env
-TELEGRAM_BOT_TOKEN=from_BotFather
-TELEGRAM_CHAT_ID=your_chat_id
-```
-
-Commands in the bot chat:
-
-| Command | Action |
-|---------|--------|
-| `/add 0x...` | Track a wallet |
-| `/wallets` | List tracked wallets |
-| `/alerts` | Recent transfer/token alerts |
-| `/help` | Help |
-
-Alerts (transfers + token deploys) are pushed automatically to the same chat.
+MIT — usage à tes risques (memecoins = très risqué).
