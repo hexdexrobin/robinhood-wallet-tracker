@@ -65,15 +65,18 @@ async function fastBuyTokenEth({
   botPath,
 }) {
   const t0 = Date.now();
-  const env = {
-    ...loadBotEnv(botPath || process.env.UNISWAP_BOT_PATH || ""),
-    ...process.env,
-  };
-  let pk = (env.PRIVATE_KEY || "").trim().replace(/^["']|["']$/g, "");
+  // Prefer uniswap-bot .env for trading keys (tracker .env must not override empty)
+  const botEnv = loadBotEnv(
+    botPath || process.env.UNISWAP_BOT_PATH || ""
+  );
+  const env = { ...process.env, ...botEnv };
+  let pk = (botEnv.PRIVATE_KEY || process.env.PRIVATE_KEY || "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
   if (!pk) throw new Error("PRIVATE_KEY missing (uniswap bot .env)");
   if (!pk.startsWith("0x")) pk = "0x" + pk;
 
-  const apiKey = env.UNISWAP_API_KEY;
+  const apiKey = botEnv.UNISWAP_API_KEY || process.env.UNISWAP_API_KEY;
   if (!apiKey) throw new Error("UNISWAP_API_KEY missing");
 
   const rpc =
