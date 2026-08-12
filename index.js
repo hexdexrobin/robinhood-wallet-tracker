@@ -211,6 +211,42 @@ async function signalTransfer(alert) {
 }
 
 /**
+ * Should we push this activity to Telegram/console as a "sign"?
+ * Skip noisy ERC-20 sells into pools/routers — only signal:
+ *  - native ETH outs (drains / eth moves)
+ *  - ETH ins to a tracked wallet
+ * Token deploys + new-wallet hops have their own alerts.
+ */
+async function isSignificantTransferAlert(item, direction) {
+  const asset = (item.asset || "").toUpperCase();
+  const category = (item.category || "").toLowerCase();
+  const to = (item.toAddress || item.to || "").toLowerCase();
+  const isEth =
+    category === "external" ||
+    asset === "ETH" ||
+    asset === "NATIVE" ||
+    asset === "" ||
+    asset === "NULL";
+
+  if (direction === "OUT") {
+    // Only ETH outs (real drains / funding moves)
+    if (!isEth) {
+      console.log(
+        `[ALERT] skip noise OUT token ${asset || category} → ${to || "?"} (pool/sell)`
+      );
+      return false;
+    }
+    // ETH out to a known burn/sentinel — skip
+    if (to && SKIP_AUTO_TRACK.has(to)) return false;
+    return true;
+  }
+
+  // IN: only ETH received on a tracked wallet
+  if (!isEth) return false;
+  return true;
+}
+
+/**
  * Build and fire an alert from an Alchemy activity item if it touches a tracked wallet.
  * Returns true if the `from` address is a tracked wallet (caller may run empty-detect).
  */
@@ -225,33 +261,37 @@ async function alertIfTrackedActivity(item, source = "webhook") {
   let fired = false;
 
   if (from && trackedWallets.has(from)) {
-    await signalTransfer({
-      direction: "OUT",
-      wallet: from,
-      from,
-      to: to || "?",
-      asset,
-      value,
-      hash,
-      category,
-      source,
-    });
-    fired = true;
+    if (await isSignificantTransferAlert(item, "OUT")) {
+      await signalTransfer({
+        direction: "OUT",
+        wallet: from,
+        from,
+        to: to || "?",
+        asset,
+        value,
+        hash,
+        category,
+        source,
+      });
+      fired = true;
+    }
   }
 
   if (to && trackedWallets.has(to) && to !== from) {
-    await signalTransfer({
-      direction: "IN",
-      wallet: to,
-      from: from || "?",
-      to,
-      asset,
-      value,
-      hash,
-      category,
-      source,
-    });
-    fired = true;
+    if (await isSignificantTransferAlert(item, "IN")) {
+      await signalTransfer({
+        direction: "IN",
+        wallet: to,
+        from: from || "?",
+        to,
+        asset,
+        value,
+        hash,
+        category,
+        source,
+      });
+      fired = true;
+    }
   }
 
   return from && trackedWallets.has(from);
@@ -489,7 +529,9 @@ async function registerAddressOnWebhook(address) {
     console.warn(
       "[TRACKER] ALCHEMY_AUTH_TOKEN missing — skipping webhook registration, enabling polling"
     );
-    enablePollingFallback("missing ALCHEMY_AUTH_TOKEN");
+    enablePollingFallback("missing ALCHEMY_AUTH_TOKEN", {
+      disableWebhooks: true,
+    });
     return;
   }
 
@@ -497,7 +539,7 @@ async function registerAddressOnWebhook(address) {
     console.warn(
       "[TRACKER] WEBHOOK_URL missing — skipping webhook registration, enabling polling"
     );
-    enablePollingFallback("missing WEBHOOK_URL");
+    enablePollingFallback("missing WEBHOOK_URL", { disableWebhooks: true });
     return;
   }
 
@@ -558,7 +600,9 @@ async function registerAddressOnWebhook(address) {
     console.error(
       `[TRACKER] ADDRESS_ACTIVITY webhook failed: ${err.message || err}`
     );
-    enablePollingFallback(err.message || String(err));
+    enablePollingFallback(err.message || String(err), {
+      disableWebhooks: true,
+    });
   }
 }
 
@@ -566,10 +610,16 @@ async function registerAddressOnWebhook(address) {
  * Flip into polling mode and start a 15s setInterval over all tracked wallets.
  * Idempotent — calling multiple times does not stack intervals.
  */
-function enablePollingFallback(reason) {
-  webhooksSupported = false;
+/**
+ * Start (or keep) the 15s polling loop over tracked wallets.
+ * Does NOT force webhooksSupported=false when used as a backup alongside webhooks.
+ */
+function enablePollingFallback(reason, { disableWebhooks = false } = {}) {
+  if (disableWebhooks) {
+    webhooksSupported = false;
+  }
   console.warn(
-    `[POLLING] Falling back to getAssetTransfers every ${POLL_INTERVAL_MS / 1000}s ` +
+    `[POLLING] getAssetTransfers every ${POLL_INTERVAL_MS / 1000}s ` +
       `(reason: ${reason})`
   );
 
@@ -645,10 +695,100 @@ async function pollAllTrackedWallets() {
 }
 
 /**
+ * For each outgoing ETH tx from a tracked wallet, find the REAL next wallet:
+ * - direct EOA transfer, OR
+ * - address encoded in calldata when sending to a helper/relay contract
+ *
+ * ONLY auto-adds when the SOURCE wallet is empty (< 0.001 ETH).
+ * That way we only track the "last" hop after a full drain.
+ */
+async function followHopWalletsFromTxs(senderNorm, txHashes, source = "webhook") {
+  // Hard requirement: source must have nothing left
+  let balance;
+  try {
+    balance = await provider.getBalance(senderNorm);
+  } catch (err) {
+    console.error(
+      `[DETECT] balance check before hop failed: ${err.message || err}`
+    );
+    return;
+  }
+  const balEth = ethers.formatEther(balance);
+  if (balance >= EMPTY_BALANCE_WEI) {
+    console.log(
+      `[DETECT] skip hop auto-add — ${senderNorm} still has ${balEth} ETH ` +
+        `(need < 0.001 to follow next wallet)`
+    );
+    return;
+  }
+  console.log(
+    `[DETECT] source empty (${balEth} ETH) — searching last hop wallet(s)`
+  );
+
+  for (const txHash of txHashes) {
+    if (!txHash || txHash.length !== 66) continue;
+    let candidates = [];
+    try {
+      candidates = await resolveNewWalletCandidates(txHash, senderNorm);
+    } catch (err) {
+      console.error(
+        `[DETECT] hop resolve failed for ${txHash}: ${err.message || err}`
+      );
+      continue;
+    }
+    for (const newAddr of candidates) {
+      if (SKIP_AUTO_TRACK.has(newAddr) || !isPlausibleWalletAddress(newAddr)) {
+        console.log(`[DETECT] skip non-wallet hop ${newAddr} (tx ${txHash})`);
+        continue;
+      }
+      if (trackedWallets.has(newAddr)) {
+        console.log(`[DETECT] hop ${newAddr} already tracked (tx ${txHash})`);
+        continue;
+      }
+      // Re-check source empty right before add (race with more funding)
+      try {
+        const bal2 = await provider.getBalance(senderNorm);
+        if (bal2 >= EMPTY_BALANCE_WEI) {
+          console.log(
+            `[DETECT] abort hop add — ${senderNorm} refilled before add`
+          );
+          return;
+        }
+      } catch {
+        /* continue with add */
+      }
+
+      console.log(
+        `[NEW WALLET] Last hop (source empty) ${newAddr} from ${senderNorm} ` +
+          `(tx ${txHash}, via=${source})`
+      );
+      try {
+        await addWallet(newAddr, {
+          source: "auto-detect-hop-empty",
+          parent: senderNorm,
+        });
+        if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+          await sendTelegram(
+            `🆕 NOUVEAU WALLET (dernier hop — source vide)\n` +
+              `from: ${senderNorm}\n` +
+              `new: ${newAddr}\n` +
+              `tx: ${txHash}`
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[NEW WALLET] failed to add ${newAddr}: ${err.message || err}`
+        );
+      }
+    }
+  }
+}
+
+/**
  * Handle activity for a sender:
- * 1) Alert transfers (in/out) for tracked wallets
- * 2) If sender is tracked → scan txs for TOKEN CREATION immediately
- * 3) If wallet empty → also scan for new wallets / further deploys
+ * 1) Alert significant transfers only (ETH drain/in — not ERC20 pool sells)
+ * 2) Token CREATE detection
+ * 3) If wallet EMPTY (< 0.001 ETH) → follow last hop + deep scan
  */
 async function handleActivityForSender(sender, activityItems = [], source = "webhook") {
   let senderNorm;
@@ -659,7 +799,7 @@ async function handleActivityForSender(sender, activityItems = [], source = "web
     return;
   }
 
-  // Always signal transfers that touch tracked wallets (in or out)
+  // Significant transfer alerts only (filters ERC-20 → pool noise)
   for (const item of activityItems) {
     try {
       await alertIfTrackedActivity(item, source);
@@ -669,11 +809,9 @@ async function handleActivityForSender(sender, activityItems = [], source = "web
   }
 
   if (!trackedWallets.has(senderNorm)) {
-    // Activity may still have alerted on IN to a tracked wallet above
     return;
   }
 
-  // --- TOKEN CREATE detection on every outgoing activity (not only when empty) ---
   const hashes = new Set();
   for (const item of activityItems) {
     const h = item.hash || item.transactionHash || item.txHash;
@@ -681,6 +819,8 @@ async function handleActivityForSender(sender, activityItems = [], source = "web
       hashes.add(h.toLowerCase());
     }
   }
+
+  // Token CREATE (direct receipt.contractAddress only — less noise)
   for (const txHash of hashes) {
     try {
       await detectTokenCreationFromTx(txHash, senderNorm, source);
@@ -705,17 +845,20 @@ async function handleActivityForSender(sender, activityItems = [], source = "web
   const balanceEth = ethers.formatEther(balance);
   console.log(`[BALANCE] ${senderNorm} balance=${balanceEth} ETH`);
 
-  if (balance >= EMPTY_BALANCE_WEI) {
+  // ONLY when nothing left: follow last hop + deep scan of recent outs
+  if (balance < EMPTY_BALANCE_WEI) {
     console.log(
-      `[BALANCE] ${senderNorm} is not empty (>= 0.001 ETH); no new-wallet scan`
+      `[DETECT] ${senderNorm} empty (< 0.001 ETH) — follow last wallet + scan`
     );
-    return;
+    if (hashes.size > 0) {
+      await followHopWalletsFromTxs(senderNorm, [...hashes], source);
+    }
+    await detectTokenDeploysAndNewWallets(senderNorm, activityItems);
+  } else {
+    console.log(
+      `[DETECT] ${senderNorm} still has funds — no hop auto-add yet`
+    );
   }
-
-  console.log(
-    `[DETECT] ${senderNorm} is empty (< 0.001 ETH) — scanning recent outgoings`
-  );
-  await detectTokenDeploysAndNewWallets(senderNorm, activityItems);
 }
 
 /**
@@ -939,41 +1082,16 @@ async function detectTokenCreationFromTx(txHash, deployer, source = "webhook") {
     }
   }
 
+  // Mint logs alone are too noisy (WETH wrap, LP NFTs, pool mints).
+  // Only treat mint as "token create" if this same tx also CREATEd a contract
+  // (receipt.contractAddress) that matches, or CREATE produced the token.
+  // Additional mint candidates that equal a newly created contract are already
+  // handled in path A. Skip pure mint spam here.
   for (const tokenAddr of mintCandidates) {
+    if (!receipt.contractAddress) break;
+    if (tokenAddr !== receipt.contractAddress.toLowerCase()) continue;
     if (found.includes(tokenAddr)) continue;
-    if (detectedTokenContracts.has(tokenAddr)) continue;
-
-    // Only alert mints if this tx was sent by our deployer (factory pattern)
-    // and the token looks like ERC-20
-    let code;
-    try {
-      code = await provider.getCode(tokenAddr);
-    } catch {
-      continue;
-    }
-    if (!code || code === "0x" || code === "0x0") continue;
-
-    const meta = await readErc20Metadata(tokenAddr);
-    if (!meta.isErc20Like) {
-      console.log(
-        `[TOKEN DEPLOY] mint log at ${tokenAddr} but not ERC-20-like — skip`
-      );
-      continue;
-    }
-
-    // Prefer mints where deployer is involved: contract create above, OR
-    // tx from deployer (always true here) — factory deploys count.
-    console.log(
-      `[TOKEN DEPLOY] MINT/factory token detected: ${tokenAddr} (tx ${txHash})`
-    );
-    await signalTokenDeploy({
-      deployer,
-      contractAddress: tokenAddr,
-      txHash,
-      meta,
-      source,
-    });
-    found.push(tokenAddr);
+    // already signaled in path A
   }
 
   return found;
@@ -990,11 +1108,22 @@ function isPlausibleWalletAddress(addr) {
     if (/^0+$/.test(hex)) return false;
     // First 4 bytes zero ⇒ almost always an ABI offset/length/amount, not an EOA
     if (hex.slice(0, 8) === "00000000") return false;
+    // type(uint160).max / burn / sentinel — common in swap/approve calldata
+    if (/^f+$/i.test(hex)) return false;
     return true;
   } catch {
     return false;
   }
 }
+
+/** Known non-wallet contracts we should never auto-track as "new wallets". */
+const SKIP_AUTO_TRACK = new Set(
+  [
+    "0xffffffffffffffffffffffffffffffffffffffff",
+    "0x0000000000000000000000000000000000000000",
+    "0x000000000000000000000000000000000000dead",
+  ].map((a) => a.toLowerCase())
+);
 
 /**
  * Extract candidate recipient addresses from tx calldata.
@@ -1277,15 +1406,13 @@ async function addWallet(rawAddress, meta = {}) {
     );
   }
 
-  // Ensure polling is running even if webhook succeeded (belt-and-suspenders
-  // while Notify support for Robinhood is uneven across accounts).
-  if (webhooksSupported !== true) {
-    enablePollingFallback(
-      webhooksSupported === false
-        ? "webhook unavailable"
-        : "webhook not confirmed — polling until proven"
-    );
-  }
+  // Always run polling as a safety net — webhooks alone missed hop wallets
+  // when Alchemy delivered late or only contract `to` without empty-state race.
+  enablePollingFallback(
+    webhooksSupported === true
+      ? "backup polling alongside webhook"
+      : "webhook unavailable or unconfirmed"
+  );
 
   return { address, alreadyTracked: false };
 }
