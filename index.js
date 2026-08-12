@@ -1222,10 +1222,32 @@ async function signalTokenDeploy({ deployer, contractAddress, txHash, meta, sour
     }
   }
 
+  // AUTO-BUY FIRST (before Telegram) — every ms counts for low MC entry
+  if (meta?.isErc20Like) {
+    // fire-and-forget but start immediately (no setImmediate delay)
+    maybeAutoBuyToken({
+      tokenAddress: contractAddress,
+      deployer,
+      symbol: String(symbol),
+      name: String(name),
+      txHash,
+      launchpad: Boolean(meta?.launchpad),
+      isErc20Like: true,
+      fromCreate: !meta?.launchpad && Boolean(contractAddress),
+      notify: (msg) =>
+        sendTelegram(msg, TELEGRAM_CHAT_ID, {
+          reply_markup: mainReplyKeyboard(),
+        }),
+    }).catch((err) => {
+      console.error(`[AUTO-BUY] failed: ${err.message || err}`);
+    });
+  }
+
+  // Telegram alert after buy is already racing
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     const buyAmt = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
     const autoOn = isEnvOn("AUTO_BUY_ENABLED");
-    await sendTelegram(
+    sendTelegram(
       `🪙 TOKEN ${meta?.launchpad ? "LANCÉ" : "CRÉÉ"}\n` +
         `deployer: ${walletDisplay(deployer)}\n` +
         `${deployer}\n` +
@@ -1234,7 +1256,7 @@ async function signalTokenDeploy({ deployer, contractAddress, txHash, meta, sour
         `decimals=${decimals} supply=${supply}\n` +
         `tx: ${txHash}\n\n` +
         (autoOn
-          ? `🛒 Auto-buy ON → ${buyAmt} ETH`
+          ? `🛒 Auto-buy ON → ${buyAmt} ETH (fast path)`
           : `⏸ Auto-buy OFF — choisis un montant :`),
       TELEGRAM_CHAT_ID,
       {
@@ -1242,29 +1264,7 @@ async function signalTokenDeploy({ deployer, contractAddress, txHash, meta, sour
           ? tokenBuyKeyboard(contractAddress)
           : mainReplyKeyboard(),
       }
-    );
-  }
-
-  // Auto-buy via robinhood-uniswap-bot when a tracked wallet launches/creates a token
-  if (meta?.isErc20Like) {
-    setImmediate(() => {
-      maybeAutoBuyToken({
-        tokenAddress: contractAddress,
-        deployer,
-        symbol: String(symbol),
-        name: String(name),
-        txHash,
-        launchpad: Boolean(meta?.launchpad),
-        isErc20Like: true,
-        fromCreate: !meta?.launchpad && Boolean(contractAddress),
-        notify: (msg) =>
-          sendTelegram(msg, TELEGRAM_CHAT_ID, {
-            reply_markup: mainReplyKeyboard(),
-          }),
-      }).catch((err) => {
-        console.error(`[AUTO-BUY] failed: ${err.message || err}`);
-      });
-    });
+    ).catch(() => {});
   }
 
   void key;
@@ -1402,49 +1402,49 @@ async function detectTokenCreationFromTx(txHash, deployer, source = "webhook") {
     }
   }
 
-  for (const [tokenAddr, info] of mintInfo) {
-    if (found.includes(tokenAddr)) continue;
+  // Process mints in parallel (speed) — first valid token triggers auto-buy ASAP
+  const mintAddrs = [...mintInfo.keys()].filter(
+    (t) =>
+      !found.includes(t) &&
+      !detectedTokenContracts.has(t) &&
+      !SKIP_TOKEN_ADDRESSES.has(t)
+  );
+
+  const mintResults = await Promise.all(
+    mintAddrs.map(async (tokenAddr) => {
+      try {
+        const code = await provider.getCode(tokenAddr);
+        if (!code || code === "0x" || code === "0x0") return null;
+        const meta = await readErc20Metadata(tokenAddr);
+        if (!meta.isErc20Like) return null;
+        if (isSkippedLaunchToken(tokenAddr, meta)) return null;
+        return { tokenAddr, meta, info: mintInfo.get(tokenAddr) };
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  for (const row of mintResults) {
+    if (!row) continue;
+    const { tokenAddr, meta, info } = row;
     if (detectedTokenContracts.has(tokenAddr)) continue;
-    if (SKIP_TOKEN_ADDRESSES.has(tokenAddr)) {
-      console.log(`[TOKEN DEPLOY] skip known infra mint ${tokenAddr}`);
-      continue;
-    }
-
-    let code;
-    try {
-      code = await provider.getCode(tokenAddr);
-    } catch {
-      continue;
-    }
-    if (!code || code === "0x" || code === "0x0") continue;
-
-    const meta = await readErc20Metadata(tokenAddr);
-    if (!meta.isErc20Like) {
-      console.log(`[TOKEN DEPLOY] mint ${tokenAddr} not ERC-20-like — skip`);
-      continue;
-    }
-    if (isSkippedLaunchToken(tokenAddr, meta)) {
-      console.log(
-        `[TOKEN DEPLOY] skip mint ${tokenAddr} symbol=${meta.symbol}`
-      );
-      continue;
-    }
-
-    // Prefer mints linked to deployer; still accept unknown new ERC20 minted
-    // in a tx sent by deployer (launchpad create+liq pattern).
     console.log(
       `[TOKEN DEPLOY] LAUNCH mint detected: ${tokenAddr} ` +
-        `symbol=${meta.symbol} name=${meta.name} toDeployer=${info.toDeployer} ` +
+        `symbol=${meta.symbol} name=${meta.name} toDeployer=${info?.toDeployer} ` +
         `tx=${txHash}`
     );
+    // Don't await full telegram — signalTokenDeploy starts auto-buy immediately
     await signalTokenDeploy({
       deployer,
       contractAddress: tokenAddr,
       txHash,
-      meta: { ...meta, launchpad: true, toDeployer: info.toDeployer },
+      meta: { ...meta, launchpad: true, toDeployer: info?.toDeployer },
       source,
     });
     found.push(tokenAddr);
+    // First real launch token is enough for sniping speed
+    if (meta.symbol && meta.symbol !== "WETH") break;
   }
 
   if (found.length === 0 && (receipt.logs || []).length > 0) {

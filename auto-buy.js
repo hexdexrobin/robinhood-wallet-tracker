@@ -185,6 +185,209 @@ async function maybeAutoBuyToken(opts) {
     console.warn(`[AUTO-BUY] balance precheck failed: ${err.message || err}`);
   }
 
+  const logsDir = path.join(__dirname, "logs");
+  fs.mkdirSync(logsDir, { recursive: true });
+  const safeSym =
+    String(symbol).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 16) || "tok";
+  const logFile = path.join(
+    logsDir,
+    `autobuy-${safeSym}-${token.slice(2, 10)}.log`
+  );
+
+  buyingNow.add(token);
+
+  const header =
+    `\n======== AUTO-BUY FAST ${new Date().toISOString()} ========\n` +
+    `token=${token} symbol=${symbol} name=${name}\n` +
+    `deployer=${deployer || "?"} launchTx=${txHash || "?"}\n` +
+    `amount=${amount} ETH slippage=${slippage}% dryRun=${dryRun}\n` +
+    `mode=fast-buy (in-process Uniswap API)\n` +
+    `====================================================\n`;
+  fs.appendFileSync(logFile, header);
+
+  console.log(
+    `[AUTO-BUY] 🛒 FAST buying ${symbol} (${token}) with ${amount} ETH` +
+      (dryRun ? " [DRY-RUN]" : "")
+  );
+
+  if (notify) {
+    await notify(
+      `🛒 AUTO-BUY (fast)\n` +
+        `${name} (${symbol})\n` +
+        `${token}\n` +
+        `montant: ${amount} ETH\n` +
+        `TP +${takeProfit}% · SL -${stopLoss}%\n` +
+        `deployer: ${deployer || "?"}`
+    );
+  }
+
+  try {
+    const { fastBuyTokenEth } = require("./fast-buy");
+    const result = await fastBuyTokenEth({
+      tokenAddress: token,
+      amountEth: amount,
+      slippage: Number(slippage),
+      dryRun,
+      botPath,
+    });
+    fs.appendFileSync(logFile, JSON.stringify(result, null, 2) + "\n");
+    boughtTokens.add(token);
+    buyingNow.delete(token);
+
+    if (result.dryRun) {
+      if (notify) {
+        await notify(
+          `🧪 FAST-BUY dry-run OK\n${symbol}\n${result.ms || "?"}ms`
+        );
+      }
+      return { ok: true, dryRun: true, ...result, logFile };
+    }
+
+    if (notify) {
+      await notify(
+        `✅ ACHAT CONFIRMÉ (fast)\n` +
+          `${name} (${symbol})\n` +
+          `${amount} ETH\n` +
+          `tx: ${result.txHash}\n` +
+          `⏱ ${result.ms}ms\n` +
+          `block ${result.blockNumber || "?"}`
+      );
+    }
+
+    // Start watch-pnl in background (TP/SL) without blocking
+    if (autoWatch && !dryRun) {
+      startWatchPnl({
+        botPath,
+        token,
+        takeProfit,
+        stopLoss,
+        interval,
+        logFile,
+      });
+    }
+
+    return { ok: true, ...result, logFile, token, amount };
+  } catch (err) {
+    buyingNow.delete(token);
+    const msg = err.message || String(err);
+    fs.appendFileSync(logFile, `ERROR: ${msg}\n`);
+    console.error(`[AUTO-BUY] fast-buy failed: ${msg}`);
+    if (notify) await notify(`❌ AUTO-BUY échoué\n${symbol}\n${msg}`);
+
+    // Fallback: old spawn path once
+    if (envBool("AUTO_BUY_SPAWN_FALLBACK", true)) {
+      console.log("[AUTO-BUY] fallback spawn uniswap-bot…");
+      return spawnUniswapBuy({
+        botPath,
+        token,
+        amount,
+        slippage,
+        takeProfit,
+        stopLoss,
+        interval,
+        dryRun,
+        autoWatch,
+        symbol,
+        name,
+        deployer,
+        txHash,
+        logFile,
+        notify,
+      });
+    }
+    return { ok: false, error: msg, logFile };
+  }
+}
+
+/** Background watch-pnl only (after fast buy) */
+function startWatchPnl({
+  botPath,
+  token,
+  takeProfit,
+  stopLoss,
+  interval,
+  logFile,
+}) {
+  const tsxBin = path.join(botPath, "node_modules", ".bin", "tsx");
+  const useTsx = fs.existsSync(tsxBin) ? tsxBin : "npx";
+  const args =
+    useTsx === "npx"
+      ? [
+          "tsx",
+          "src/index.ts",
+          "watch-pnl",
+          "--token",
+          token,
+          "--take-profit",
+          takeProfit,
+          "--stop-loss",
+          stopLoss,
+          "--interval",
+          interval,
+        ]
+      : [
+          "src/index.ts",
+          "watch-pnl",
+          "--token",
+          token,
+          "--take-profit",
+          takeProfit,
+          "--stop-loss",
+          stopLoss,
+          "--interval",
+          interval,
+        ];
+
+  // Need a position recorded — watch-pnl with --token --cost imports from balance
+  // After buy, tokens are in wallet; import cost = amount spent
+  // Actually watch-pnl --token --cost only if no open position.
+  // recordBuy happens inside swap command, not fast-buy — so we pass cost:
+  const amount = process.env.AUTO_BUY_ETH_AMOUNT || "0.001";
+  if (useTsx === "npx") {
+    args.push("--cost", amount);
+  } else {
+    args.push("--cost", amount);
+  }
+
+  const logFd = fs.openSync(logFile, "a");
+  fs.writeSync(
+    logFd,
+    `\n--- watch-pnl start ${new Date().toISOString()} ---\n`
+  );
+  const child = spawn(useTsx, args, {
+    cwd: botPath,
+    env: { ...process.env, ...loadUniswapEnv(botPath) },
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+  });
+  child.unref();
+  child.on("exit", () => {
+    try {
+      fs.closeSync(logFd);
+    } catch {
+      /* */
+    }
+  });
+  console.log(`[AUTO-BUY] watch-pnl started pid=${child.pid} token=${token}`);
+  return child;
+}
+
+/** Legacy spawn full swap+watch (fallback) */
+function spawnUniswapBuy(opts) {
+  const {
+    botPath,
+    token,
+    amount,
+    slippage,
+    takeProfit,
+    stopLoss,
+    interval,
+    dryRun,
+    autoWatch,
+    symbol,
+    logFile,
+    notify,
+  } = opts;
   const tsxBin = path.join(botPath, "node_modules", ".bin", "tsx");
   const useTsx = fs.existsSync(tsxBin) ? tsxBin : "npx";
   const baseArgs = [
@@ -204,107 +407,36 @@ async function maybeAutoBuyToken(opts) {
     stopLoss,
   ];
   const args = useTsx === "npx" ? ["tsx", ...baseArgs] : baseArgs;
-  if (ammOnly) args.push("--amm-only");
+  args.push("--amm-only");
   if (dryRun) args.push("--dry-run");
-  if (autoWatch && !dryRun) {
-    args.push("--auto-watch", "--interval", interval);
-  }
-
-  const logsDir = path.join(__dirname, "logs");
-  fs.mkdirSync(logsDir, { recursive: true });
-  const safeSym = String(symbol).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 16) || "tok";
-  const logFile = path.join(
-    logsDir,
-    `autobuy-${safeSym}-${token.slice(2, 10)}.log`
-  );
-  const logFd = fs.openSync(logFile, "a");
-
-  const childEnv = {
-    ...process.env,
-    ...loadUniswapEnv(botPath),
-  };
+  if (autoWatch && !dryRun) args.push("--auto-watch", "--interval", interval);
 
   buyingNow.add(token);
-
-  const header =
-    `\n======== AUTO-BUY ${new Date().toISOString()} ========\n` +
-    `token=${token} symbol=${symbol} name=${name}\n` +
-    `deployer=${deployer || "?"} launchTx=${txHash || "?"}\n` +
-    `amount=${amount} ETH slippage=${slippage}% dryRun=${dryRun}\n` +
-    `cmd: ${useTsx} ${args.join(" ")}\n` +
-    `====================================================\n`;
-  fs.writeSync(logFd, header);
-
-  console.log(
-    `[AUTO-BUY] 🛒 buying ${symbol} (${token}) with ${amount} ETH` +
-      (dryRun ? " [DRY-RUN]" : "")
-  );
-
-  if (notify) {
-    await notify(
-      `🛒 AUTO-BUY démarré\n` +
-        `${name} (${symbol})\n` +
-        `${token}\n` +
-        `montant: ${amount} ETH\n` +
-        `slippage: ${slippage}%\n` +
-        `TP: +${takeProfit}%\n` +
-        `SL: -${stopLoss}%\n` +
-        `watch: ${autoWatch && !dryRun ? "oui" : "non"}\n` +
-        `dry-run: ${dryRun}\n` +
-        `deployer: ${deployer || "?"}`
-    );
-  }
+  const logFd = fs.openSync(logFile, "a");
+  fs.writeSync(logFd, `FALLBACK SPAWN: ${useTsx} ${args.join(" ")}\n`);
 
   return new Promise((resolve) => {
     const child = spawn(useTsx, args, {
       cwd: botPath,
-      env: childEnv,
+      env: { ...process.env, ...loadUniswapEnv(botPath) },
       detached: true,
       stdio: ["ignore", logFd, logFd],
     });
-
     child.on("error", async (err) => {
       buyingNow.delete(token);
-      console.error(`[AUTO-BUY] spawn error: ${err.message}`);
-      if (notify) await notify(`❌ AUTO-BUY spawn failed: ${err.message}`);
-      try {
-        fs.closeSync(logFd);
-      } catch {
-        /* */
-      }
+      if (notify) await notify(`❌ fallback spawn: ${err.message}`);
       resolve({ ok: false, error: err.message, logFile });
     });
-
-    // Keep process independent of tracker restarts
     child.unref();
-
-    // Do NOT close logFd immediately — watch-pnl runs for minutes/hours
-    // Closing the fd early can break child stdout and kill monitoring.
-    const notifyStarted = setTimeout(async () => {
+    setTimeout(() => {
       buyingNow.delete(token);
       boughtTokens.add(token);
-      console.log(
-        `[AUTO-BUY] process launched pid=${child.pid} log=${logFile}`
-      );
       if (notify) {
-        await notify(
-          `✅ AUTO-BUY process lancé\n` +
-            `${symbol} pid=${child.pid}\n` +
-            `montant: ${amount} ETH\n` +
-            `TP +${takeProfit}% · SL -${stopLoss}%\n` +
-            `log: ${path.basename(logFile)}\n` +
-            `(watch PnL actif jusqu'à vente TP/SL)`
-        );
+        notify(`⚠️ Fallback spawn OK\n${symbol} pid=${child.pid}`);
       }
-      resolve({ ok: true, pid: child.pid, logFile, token, amount });
-    }, 2500);
-
-    child.on("exit", (code, signal) => {
-      clearTimeout(notifyStarted);
-      buyingNow.delete(token);
-      console.log(
-        `[AUTO-BUY] child exit code=${code} signal=${signal} ${symbol}`
-      );
+      resolve({ ok: true, pid: child.pid, logFile, token, amount, fallback: true });
+    }, 2000);
+    child.on("exit", () => {
       try {
         fs.closeSync(logFd);
       } catch {
